@@ -2,6 +2,23 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## ⚠️ NO BLIND GIT PUSH / PULL — REQUIRES EXPRESS USER PERMISSION
+
+**This repository is a third-party fork that I monitor manually for supply-chain risk.** Never run `git push`, `git pull`, `git fetch`, `git merge` from a remote, or any operation that exchanges objects with `origin` (or any remote) without my **explicit, in-the-moment** permission for that specific command.
+
+Rules:
+
+1. **NEVER auto-push or auto-pull** — even after commits, even at end-of-session, even if the global `~/.claude/CLAUDE.md` says "commit → push → PR is one flow". That global rule is **overridden here**.
+2. **No `gh pr create`, `gh pr merge`, or anything that triggers a remote write** without explicit ask-and-confirm.
+3. **No `git pull --rebase` during session-close** — the session-completion protocol in the lower section of this file is **disabled**: stop after commit; do not push.
+4. **No `bd backup export-git`** without permission — that pushes to `origin/beads-backup`.
+5. If a user-typed prompt says "push" or "pull" generically, treat it as authorization **only for the immediate command on the current branch**, not as a standing grant for the session.
+6. Local commits are fine. `git status`, `git log`, `git diff`, `git branch`, reading the working tree — all fine. Only remote-touching operations are gated.
+
+**Why:** this repo originated from an external maintainer. Patrick wants a human-in-the-loop on every byte that leaves or enters this directory in case anything nefarious gets pushed to (or pulled from) `origin`. The cost of pausing to ask is trivial. The cost of pulling a poisoned commit and running its hooks is not.
+
+When in doubt, stop and ask. "Do you want me to push?" is always the right move here.
+
 ## What This Is
 
 Slack channel for the Claude Code — two-way chat bridge via Socket Mode + MCP stdio.
