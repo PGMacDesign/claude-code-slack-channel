@@ -21,43 +21,89 @@ import {
   AUDIT_RECEIPTS_MAX,
   type AuditReceiptPostArgs,
   type AuditReceiptPostError,
+  allowedSinkFor,
+  assertNoSecretValues,
   assertOutboundAllowed,
   assertSendable,
   buildAndPostAuditReceipt,
   buildAuditReceiptMessage,
+  buildSecretPlaceholderMap,
+  buildSecretValueSet,
   type ChannelPolicy,
   chunkText,
+  classifyDeliveryError,
+  computeBackoffMs,
+  DELIVERY_METADATA_EVENT_TYPE,
+  type DeliveryObligation,
+  declaredSecretNames,
   defaultAccess,
+  deliveryIdempotencyKey,
   detectNewAllowFrom,
   EVENT_DEDUP_TTL_MS,
+  ExfilBlockedError,
   enforceAuditReceiptCap,
   escMrkdwn,
+  extractSlackErrorCode,
+  findSecretDeclaration,
   type GateOptions,
   gate,
   generateCode,
   generateCorrelationId,
+  type IdempotentSendDeps,
+  type InFlightTurn,
   isDuplicateEvent,
   isSlackFileUrl,
   loadSession,
   MAX_PAIRING_REPLIES,
   MAX_PENDING,
   MIGRATED_DEFAULT_THREAD,
+  makeIdempotentSend,
   migrateFlatSessions,
+  NON_RETRYABLE_SLACK_ERRORS,
   PAIRING_EXPIRY_MS,
   PERMISSION_REPLY_RE,
   parseSendableRoots,
   pruneExpired,
+  redactSecretValues,
   resolveJournalPath,
+  SECRET_DECLARATIONS,
+  type SecretDeclaration,
+  type SecretSink,
   type Session,
   type SessionKey,
   sanitizeDisplayName,
   sanitizeFilename,
   saveSession,
+  secretNameFromPlaceholder,
+  secretPlaceholder,
   sessionPath,
   shouldPostAuditReceipt,
   validateSendableRoots,
 } from './lib.ts'
-import { createSessionSupervisor } from './supervisor.ts'
+import {
+  beginDurableStream,
+  createDeliverySendDeps,
+  createFileSendDeps,
+  createReplyPoster,
+  DurableUnavailableError,
+  deliverChunkedReplyDurably,
+  deliverFileReplyDurably,
+  deliverReplyDurably,
+  type FileUploadDeps,
+  type ReplyPoster,
+  sendFileObligation,
+} from './slack-delivery.ts'
+import {
+  classifyRecovery,
+  createSessionSupervisor,
+  DEFAULT_LEASE_TTL_MS,
+  DEFAULT_MAX_DELIVERY_ATTEMPTS,
+  heartbeatLease,
+  isLeaseStale,
+  type Lease,
+  resolveLeaseTtlMs,
+  type SessionHandle,
+} from './supervisor.ts'
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -323,6 +369,92 @@ describe('gate', () => {
     expect(result.action).toBe('deliver')
   })
 
+  // -- requireMention thread-stickiness (ccsc-apj.1) --
+  // "Mention once, then converse": a human who has engaged a thread by
+  // mentioning the bot can keep talking in that thread without re-mentioning.
+  // The engaged set is keyed by the SESSION thread (thread_ts ?? ts).
+
+  test('delivers un-mentioned human reply when the thread is already engaged (ccsc-apj.1)', async () => {
+    const { deliveredThreadKey } = await import('./lib.ts')
+    const access = makeAccess({
+      channels: { C_MENTION: { requireMention: true, allowFrom: [] } },
+    })
+    const engagedThreads = new Set([deliveredThreadKey('C_MENTION', '1711.0001')])
+    const result = await gate(
+      {
+        user: 'U123',
+        channel: 'C_MENTION',
+        channel_type: 'channel',
+        text: 'and also do Y',
+        thread_ts: '1711.0001',
+        ts: '1711.0002',
+      },
+      makeOpts({ access, botUserId: 'U_BOT', engagedThreads }),
+    )
+    expect(result.action).toBe('deliver')
+  })
+
+  test('delivers un-mentioned human top-level follow-up keyed by session thread (ccsc-apj.1)', async () => {
+    // Opener was a top-level mention ts=T1 → engaged key uses thread_ts ?? ts = T1.
+    // The bot replied in thread T1; the human's follow-up arrives with thread_ts=T1.
+    const { deliveredThreadKey } = await import('./lib.ts')
+    const access = makeAccess({
+      channels: { C_MENTION: { requireMention: true, allowFrom: [] } },
+    })
+    const engagedThreads = new Set([deliveredThreadKey('C_MENTION', 'T1')])
+    const result = await gate(
+      {
+        user: 'U123',
+        channel: 'C_MENTION',
+        channel_type: 'channel',
+        text: 'thanks',
+        thread_ts: 'T1',
+        ts: 'T2',
+      },
+      makeOpts({ access, botUserId: 'U_BOT', engagedThreads }),
+    )
+    expect(result.action).toBe('deliver')
+  })
+
+  test('still drops un-mentioned human message when the thread is NOT yet engaged (ccsc-apj.1)', async () => {
+    const access = makeAccess({
+      channels: { C_MENTION: { requireMention: true, allowFrom: [] } },
+    })
+    const result = await gate(
+      {
+        user: 'U123',
+        channel: 'C_MENTION',
+        channel_type: 'channel',
+        text: 'hi',
+        thread_ts: 'T9',
+        ts: 'T9',
+      },
+      makeOpts({ access, botUserId: 'U_BOT', engagedThreads: new Set() }),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  test('does NOT make peer bots sticky — un-mentioned peer bot in an engaged thread is dropped (ccsc-apj.1)', async () => {
+    const { deliveredThreadKey } = await import('./lib.ts')
+    const access = makeAccess({
+      channels: { C_MENTION: { requireMention: true, allowFrom: [], allowBotIds: ['U_PEER'] } },
+    })
+    const engagedThreads = new Set([deliveredThreadKey('C_MENTION', 'T1')])
+    const result = await gate(
+      {
+        bot_id: 'B_PEER',
+        user: 'U_PEER',
+        channel: 'C_MENTION',
+        channel_type: 'channel',
+        text: 'still looping',
+        thread_ts: 'T1',
+        ts: 'T2',
+      },
+      makeOpts({ access, botUserId: 'U_BOT', engagedThreads }),
+    )
+    expect(result.action).toBe('drop')
+  })
+
   test('drops channel messages when user not in channel allowFrom', async () => {
     const access = makeAccess({
       channels: { C_RESTRICTED: { requireMention: false, allowFrom: ['U_VIP'] } },
@@ -343,6 +475,265 @@ describe('gate', () => {
       makeOpts({ access }),
     )
     expect(result.action).toBe('deliver')
+  })
+
+  // -- isMentioned via Slack blocks (ccsc-apj.4) --
+  // A <@bot> quoted inside a code block or blockquote must NOT engage a
+  // requireMention channel; a real mention in a normal section/list must.
+
+  test('engages on a real mention in a rich_text section via blocks (ccsc-apj.4)', async () => {
+    const access = makeAccess({ channels: { C_M: { requireMention: true, allowFrom: [] } } })
+    const result = await gate(
+      {
+        user: 'U1',
+        channel: 'C_M',
+        channel_type: 'channel',
+        text: 'hey <@U_BOT> help',
+        blocks: [
+          {
+            type: 'rich_text',
+            elements: [
+              {
+                type: 'rich_text_section',
+                elements: [
+                  { type: 'text', text: 'hey ' },
+                  { type: 'user', user_id: 'U_BOT' },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+      makeOpts({ access, botUserId: 'U_BOT' }),
+    )
+    expect(result.action).toBe('deliver')
+  })
+
+  test('does NOT engage on a <@bot> inside a code block (ccsc-apj.4)', async () => {
+    const access = makeAccess({ channels: { C_M: { requireMention: true, allowFrom: [] } } })
+    const result = await gate(
+      {
+        user: 'U1',
+        channel: 'C_M',
+        channel_type: 'channel',
+        // raw text still contains <@U_BOT> — proving the substring check would have falsely matched
+        text: 'see `<@U_BOT>`',
+        blocks: [
+          {
+            type: 'rich_text',
+            elements: [
+              { type: 'rich_text_preformatted', elements: [{ type: 'user', user_id: 'U_BOT' }] },
+            ],
+          },
+        ],
+      },
+      makeOpts({ access, botUserId: 'U_BOT' }),
+    )
+    expect(result.action).toBe('drop')
+    expect(result.dropReason).toBe('channel.require_mention')
+  })
+
+  test('does NOT engage on a <@bot> inside a blockquote (ccsc-apj.4)', async () => {
+    const access = makeAccess({ channels: { C_M: { requireMention: true, allowFrom: [] } } })
+    const result = await gate(
+      {
+        user: 'U1',
+        channel: 'C_M',
+        channel_type: 'channel',
+        text: '> <@U_BOT> said hi',
+        blocks: [
+          {
+            type: 'rich_text',
+            elements: [{ type: 'rich_text_quote', elements: [{ type: 'user', user_id: 'U_BOT' }] }],
+          },
+        ],
+      },
+      makeOpts({ access, botUserId: 'U_BOT' }),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  test('engages on a mention nested inside a rich_text_list (ccsc-apj.4)', async () => {
+    const access = makeAccess({ channels: { C_M: { requireMention: true, allowFrom: [] } } })
+    const result = await gate(
+      {
+        user: 'U1',
+        channel: 'C_M',
+        channel_type: 'channel',
+        text: '- <@U_BOT>',
+        blocks: [
+          {
+            type: 'rich_text',
+            elements: [
+              {
+                type: 'rich_text_list',
+                elements: [
+                  { type: 'rich_text_section', elements: [{ type: 'user', user_id: 'U_BOT' }] },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+      makeOpts({ access, botUserId: 'U_BOT' }),
+    )
+    expect(result.action).toBe('deliver')
+  })
+
+  test('falls back to substring mention when no blocks are present (ccsc-apj.4)', async () => {
+    const access = makeAccess({ channels: { C_M: { requireMention: true, allowFrom: [] } } })
+    const result = await gate(
+      { user: 'U1', channel: 'C_M', channel_type: 'channel', text: 'hey <@U_BOT>' },
+      makeOpts({ access, botUserId: 'U_BOT' }),
+    )
+    expect(result.action).toBe('deliver')
+  })
+
+  test('falls back to substring when blocks are layout-only with no rich_text (ccsc-apj.4)', async () => {
+    // Block Kit section/context blocks (typical of bots/integrations) carry no
+    // rich_text, so the structured path must not swallow a real mention.
+    const access = makeAccess({ channels: { C_M: { requireMention: true, allowFrom: [] } } })
+    const result = await gate(
+      {
+        user: 'U1',
+        channel: 'C_M',
+        channel_type: 'channel',
+        text: 'hey <@U_BOT>',
+        blocks: [{ type: 'section', text: { type: 'mrkdwn', text: 'hey <@U_BOT>' } }],
+      },
+      makeOpts({ access, botUserId: 'U_BOT' }),
+    )
+    expect(result.action).toBe('deliver')
+  })
+
+  // -- dropReason on every drop branch (ccsc-apj.2) --
+  // Each inbound drop now carries a structured reason so the journal
+  // (gate.inbound.drop, server.ts) explains why Claude stayed silent.
+
+  test('self-echo drop carries dropReason self.echo (ccsc-apj.2)', async () => {
+    const result = await gate(
+      { bot_id: 'B_BOT', user: 'U_BOT', channel: 'C1', channel_type: 'channel' },
+      makeOpts(),
+    )
+    expect(result.action).toBe('drop')
+    expect(result.dropReason).toBe('self.echo')
+  })
+
+  test('non-allowlisted bot drop carries dropReason bot.not_allowlisted (ccsc-apj.2)', async () => {
+    const access = makeAccess({ channels: { C1: { requireMention: false, allowFrom: [] } } })
+    const result = await gate(
+      { bot_id: 'B_PEER', user: 'U_PEER', channel: 'C1', channel_type: 'channel', text: 'hi' },
+      makeOpts({ access }),
+    )
+    expect(result.dropReason).toBe('bot.not_allowlisted')
+  })
+
+  test('permission-relay bot drop carries dropReason bot.permission_relay (ccsc-apj.2)', async () => {
+    const access = makeAccess({
+      channels: { C1: { requireMention: false, allowFrom: [], allowBotIds: ['U_PEER'] } },
+    })
+    const result = await gate(
+      {
+        bot_id: 'B_PEER',
+        user: 'U_PEER',
+        channel: 'C1',
+        channel_type: 'channel',
+        text: 'yes abcde',
+      },
+      makeOpts({ access }),
+    )
+    expect(result.dropReason).toBe('bot.permission_relay')
+  })
+
+  test('filtered subtype drop carries dropReason subtype.filtered (ccsc-apj.2)', async () => {
+    const result = await gate(
+      { subtype: 'message_changed', user: 'U1', channel_type: 'channel', channel: 'C1' },
+      makeOpts(),
+    )
+    expect(result.dropReason).toBe('subtype.filtered')
+  })
+
+  test('no-user drop carries dropReason event.no_user (ccsc-apj.2)', async () => {
+    const result = await gate({ channel_type: 'channel', channel: 'C1' }, makeOpts())
+    expect(result.dropReason).toBe('event.no_user')
+  })
+
+  test('closed-DM drop carries dropReason dm.policy_closed (ccsc-apj.2)', async () => {
+    const access = makeAccess({ dmPolicy: 'disabled' })
+    const result = await gate(
+      { user: 'U_X', channel_type: 'im', channel: 'D1' },
+      makeOpts({ access }),
+    )
+    expect(result.dropReason).toBe('dm.policy_closed')
+  })
+
+  test('pairing-cap drop carries dropReason dm.pairing_cap (ccsc-apj.2)', async () => {
+    const access = makeAccess({
+      dmPolicy: 'pairing',
+      pending: {
+        ABC123: {
+          senderId: 'U_M',
+          chatId: 'D1',
+          createdAt: Date.now(),
+          expiresAt: Date.now() + PAIRING_EXPIRY_MS,
+          replies: MAX_PAIRING_REPLIES,
+        },
+      },
+    })
+    const result = await gate(
+      { user: 'U_M', channel_type: 'im', channel: 'D1' },
+      makeOpts({ access }),
+    )
+    expect(result.dropReason).toBe('dm.pairing_cap')
+  })
+
+  test('pending-full drop carries dropReason dm.pending_full (ccsc-apj.2)', async () => {
+    const pending: Access['pending'] = {}
+    for (let i = 0; i < MAX_PENDING; i++) {
+      pending[`CODE${i}`] = {
+        senderId: `U_P${i}`,
+        chatId: 'D1',
+        createdAt: Date.now(),
+        expiresAt: Date.now() + PAIRING_EXPIRY_MS,
+        replies: 1,
+      }
+    }
+    const access = makeAccess({ dmPolicy: 'pairing', pending })
+    const result = await gate(
+      { user: 'U_OVF', channel_type: 'im', channel: 'D1' },
+      makeOpts({ access }),
+    )
+    expect(result.dropReason).toBe('dm.pending_full')
+  })
+
+  test('non-opted channel drop carries dropReason channel.not_opted (ccsc-apj.2)', async () => {
+    const result = await gate(
+      { user: 'U1', channel: 'C_UNKNOWN', channel_type: 'channel' },
+      makeOpts(),
+    )
+    expect(result.dropReason).toBe('channel.not_opted')
+  })
+
+  test('channel allowFrom miss drop carries dropReason channel.allowfrom_miss (ccsc-apj.2)', async () => {
+    const access = makeAccess({
+      channels: { C_R: { requireMention: false, allowFrom: ['U_VIP'] } },
+    })
+    const result = await gate(
+      { user: 'U_NO', channel: 'C_R', channel_type: 'channel' },
+      makeOpts({ access }),
+    )
+    expect(result.dropReason).toBe('channel.allowfrom_miss')
+  })
+
+  test('requireMention no-mention drop carries dropReason channel.require_mention (ccsc-apj.2)', async () => {
+    const access = makeAccess({
+      channels: { C_M: { requireMention: true, allowFrom: [] } },
+    })
+    const result = await gate(
+      { user: 'U1', channel: 'C_M', channel_type: 'channel', text: 'hi' },
+      makeOpts({ access }),
+    )
+    expect(result.dropReason).toBe('channel.require_mention')
   })
 
   // -- allowBotIds (cross-bot coordination) --
@@ -623,6 +1014,347 @@ describe('gate', () => {
 // The new allowlist-based assertSendable uses realpathSync to follow symlinks,
 // so tests must operate on real files under a temp directory rather than
 // purely-lexical paths.
+
+// ---------------------------------------------------------------------------
+// Secret declarations (ccsc-z0n.1) — one table, three consumers, no drift
+// ---------------------------------------------------------------------------
+
+describe('secret declarations (ccsc-z0n.1)', () => {
+  test('declares the two Slack tokens the runtime loads', () => {
+    const names = SECRET_DECLARATIONS.map((d) => d.name).sort()
+    expect(names).toEqual(['SLACK_APP_TOKEN', 'SLACK_BOT_TOKEN'])
+  })
+
+  test('table is frozen and has no duplicate names', () => {
+    expect(Object.isFrozen(SECRET_DECLARATIONS)).toBe(true)
+    const names = SECRET_DECLARATIONS.map((d) => d.name)
+    expect(new Set(names).size).toBe(names.length)
+  })
+
+  test('every declaration carries a non-empty value prefix and injection point', () => {
+    for (const d of SECRET_DECLARATIONS) {
+      expect(d.valuePrefix.length).toBeGreaterThan(0)
+      expect(d.injectionPoint.length).toBeGreaterThan(0)
+      expect(d.envVar.length).toBeGreaterThan(0)
+    }
+  })
+
+  test('declared value prefixes match the boot-time token shape checks', () => {
+    // server.ts validates xoxb-/xapp- at boot; the table is the source those
+    // prefixes should ultimately derive from. Lock the correspondence here.
+    expect(findSecretDeclaration('SLACK_BOT_TOKEN')?.valuePrefix).toBe('xoxb-')
+    expect(findSecretDeclaration('SLACK_APP_TOKEN')?.valuePrefix).toBe('xapp-')
+  })
+
+  describe('placeholder consumer', () => {
+    test('round-trips name → placeholder → name for every declared secret', () => {
+      for (const d of SECRET_DECLARATIONS) {
+        const ph = secretPlaceholder(d.name)
+        expect(secretNameFromPlaceholder(ph)).toBe(d.name)
+      }
+    })
+
+    test('placeholder never contains the declared live-value prefix', () => {
+      for (const d of SECRET_DECLARATIONS) {
+        expect(secretPlaceholder(d.name)).not.toContain(d.valuePrefix)
+      }
+    })
+
+    test('non-placeholder strings decode to undefined', () => {
+      expect(secretNameFromPlaceholder('xoxb-1-2-realtokenlike')).toBeUndefined()
+      expect(secretNameFromPlaceholder('{{CCSC_SECRET:}}')).toBeUndefined()
+      expect(secretNameFromPlaceholder('SLACK_BOT_TOKEN')).toBeUndefined()
+      expect(secretNameFromPlaceholder('  {{CCSC_SECRET:SLACK_BOT_TOKEN}}  ')).toBeUndefined()
+    })
+  })
+
+  describe('guard consumer', () => {
+    test('watch-set is exactly the declared names — no second list', () => {
+      expect(declaredSecretNames().sort()).toEqual(SECRET_DECLARATIONS.map((d) => d.name).sort())
+    })
+
+    test('buildSecretValueSet collects only resolved declared values', () => {
+      const set = buildSecretValueSet((d) =>
+        d.name === 'SLACK_BOT_TOKEN' ? 'xoxb-live-bot' : 'xapp-live-app',
+      )
+      expect(set.has('xoxb-live-bot')).toBe(true)
+      expect(set.has('xapp-live-app')).toBe(true)
+      expect(set.size).toBe(2)
+    })
+
+    test('buildSecretValueSet skips empty/undefined values', () => {
+      const set = buildSecretValueSet((d) => (d.name === 'SLACK_BOT_TOKEN' ? 'xoxb-live-bot' : ''))
+      expect(set.has('xoxb-live-bot')).toBe(true)
+      expect(set.size).toBe(1)
+
+      const none = buildSecretValueSet(() => undefined)
+      expect(none.size).toBe(0)
+    })
+
+    test('buildSecretValueSet derives from the table, not the resolver keys', () => {
+      // A resolver that also "knows" an undeclared secret must NOT leak it into
+      // the guard set — the set is keyed by the declaration table only.
+      const set = buildSecretValueSet((d) => `value-for-${d.name}`)
+      expect([...set]).not.toContain('value-for-UNDECLARED_SECRET')
+      expect(set.size).toBe(SECRET_DECLARATIONS.length)
+    })
+
+    test('buildSecretValueSet collapses duplicate values', () => {
+      const set = buildSecretValueSet(() => 'same-value-everywhere')
+      expect(set.size).toBe(1)
+    })
+  })
+
+  describe('routing consumer', () => {
+    test('allowedSinkFor returns the declared sink for each secret', () => {
+      expect(allowedSinkFor('SLACK_BOT_TOKEN')).toBe('slack-web-api')
+      expect(allowedSinkFor('SLACK_APP_TOKEN')).toBe('slack-socket-api')
+    })
+
+    test('allowedSinkFor returns undefined for an undeclared name', () => {
+      expect(allowedSinkFor('SLACK_NOT_A_TOKEN')).toBeUndefined()
+    })
+
+    test('every declared sink is a valid SecretSink', () => {
+      const valid: SecretSink[] = ['slack-web-api', 'slack-socket-api', 'none']
+      for (const d of SECRET_DECLARATIONS) {
+        expect(valid).toContain(d.allowedSink)
+      }
+    })
+  })
+
+  test('all three consumers derive from the same declaration (no drift)', () => {
+    // The core declaration-as-enforcement property: for every row in the one
+    // table, the placeholder, the guard watch-set, and the routing rule are all
+    // keyed on that row's `name` — there is no fourth place a secret is defined.
+    const guardNames = new Set(declaredSecretNames())
+    for (const d of SECRET_DECLARATIONS) {
+      // placeholder consumer
+      expect(secretNameFromPlaceholder(secretPlaceholder(d.name))).toBe(d.name)
+      // guard consumer
+      expect(guardNames.has(d.name)).toBe(true)
+      // routing consumer
+      expect(allowedSinkFor(d.name)).toBe(d.allowedSink)
+    }
+  })
+
+  test('SecretDeclaration shape is structurally enforced at compile time', () => {
+    // Type-level assertion (compiled by tsc --noEmit): a declaration assembled
+    // from the public type must match a table row by value.
+    const sample: SecretDeclaration = SECRET_DECLARATIONS[0]!
+    expect(sample.name).toBe('SLACK_BOT_TOKEN')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// assertNoSecretValues (ccsc-z0n.3) — value-exfiltration guard
+// ---------------------------------------------------------------------------
+
+describe('assertNoSecretValues (ccsc-z0n.3)', () => {
+  // Sentinel stand-in values, NOT real token shapes. The guard does pure
+  // substring matching (it is value-agnostic), so the test exercises identical
+  // logic without embedding `xoxb-`/`xapp-`-shaped strings that would (a) trip
+  // GitHub push protection and (b) violate the repo's no-token-fixtures rule.
+  // The real token *shapes* are validated separately in the schema tests above.
+  const BOT = 'CCSC-TEST-BOT-SECRET-value-not-a-real-token'
+  const APP = 'CCSC-TEST-APP-SECRET-value-not-a-real-token'
+  const secrets = new Set([BOT, APP])
+  const BLOCK_MSG = 'Blocked: outbound payload contains a declared secret value'
+
+  test('throws when the payload IS a secret value', () => {
+    expect(() => assertNoSecretValues(BOT, secrets)).toThrow(BLOCK_MSG)
+  })
+
+  test('detects a secret value anywhere in the payload (start / middle / end)', () => {
+    expect(() => assertNoSecretValues(`${BOT} trailing text`, secrets)).toThrow(BLOCK_MSG)
+    expect(() => assertNoSecretValues(`leading ${BOT} trailing`, secrets)).toThrow(BLOCK_MSG)
+    expect(() => assertNoSecretValues(`text then ${APP}`, secrets)).toThrow(BLOCK_MSG)
+  })
+
+  // The three wired call sites in server.ts all reduce to "string contains
+  // value" at the guard — the guard is content-agnostic; the wiring chooses
+  // which strings to scan (reply/edit text, file body, attachment filename).
+  test('blocks the value embedded in message text', () => {
+    expect(() => assertNoSecretValues(`here is the token: ${BOT}, oops`, secrets)).toThrow(
+      BLOCK_MSG,
+    )
+  })
+
+  test('blocks the value embedded in a file body', () => {
+    const fileBody = `# config\nSLACK_BOT_TOKEN=${BOT}\nDEBUG=true\n`
+    expect(() => assertNoSecretValues(fileBody, secrets)).toThrow(BLOCK_MSG)
+  })
+
+  test('blocks the value smuggled into an attachment filename', () => {
+    expect(() => assertNoSecretValues(`leak-${APP}.txt`, secrets)).toThrow(BLOCK_MSG)
+  })
+
+  test('the error message never echoes the matched value or the payload', () => {
+    try {
+      assertNoSecretValues(`secret is ${BOT} do not log`, secrets)
+      throw new Error('expected assertNoSecretValues to throw')
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      expect(msg).toBe(BLOCK_MSG)
+      expect(msg).not.toContain(BOT)
+      expect(msg).not.toContain('do not log')
+    }
+  })
+
+  test('allows a clean payload that contains no secret value', () => {
+    expect(() => assertNoSecretValues('a perfectly ordinary reply', secrets)).not.toThrow()
+    // A near-miss (a strict prefix of the value, not the whole value) must NOT
+    // trip the guard — only the full secret value matches.
+    expect(() => assertNoSecretValues('CCSC-TEST-BOT-SECRET only', secrets)).not.toThrow()
+  })
+
+  test('empty value set is a no-op even for token-shaped text', () => {
+    expect(() => assertNoSecretValues(BOT, new Set())).not.toThrow()
+  })
+
+  test('empty / non-string payloads are no-ops', () => {
+    expect(() => assertNoSecretValues('', secrets)).not.toThrow()
+    // Defensive: a non-string slipping through must not throw a TypeError.
+    expect(() => assertNoSecretValues(undefined as unknown as string, secrets)).not.toThrow()
+    expect(() => assertNoSecretValues(null as unknown as string, secrets)).not.toThrow()
+  })
+
+  test('blocks if ANY one of several declared values is present', () => {
+    expect(() => assertNoSecretValues(`only the app token ${APP} here`, secrets)).toThrow(BLOCK_MSG)
+  })
+
+  test('an empty-string entry in the set never matches', () => {
+    // buildSecretValueSet skips empty values, but guard must be robust anyway:
+    // an empty string is a substring of every payload and must NOT trip it.
+    const withEmpty = new Set(['', BOT])
+    expect(() => assertNoSecretValues('clean text', withEmpty)).not.toThrow()
+    expect(() => assertNoSecretValues(BOT, withEmpty)).toThrow(BLOCK_MSG)
+  })
+
+  test('seam: buildSecretValueSet drives the guard end-to-end (ccsc-z0n.1 → .3)', () => {
+    // Mirror how server.ts builds the set: resolve each declaration to a live
+    // value, then guard against it. Proves the guard's watch-set comes from the
+    // declaration table, not a hand-maintained list.
+    const resolved = buildSecretValueSet((d) =>
+      d.name === 'SLACK_BOT_TOKEN' ? BOT : d.name === 'SLACK_APP_TOKEN' ? APP : undefined,
+    )
+    expect(() => assertNoSecretValues(`payload with ${BOT}`, resolved)).toThrow(BLOCK_MSG)
+    expect(() => assertNoSecretValues(`payload with ${APP}`, resolved)).toThrow(BLOCK_MSG)
+    expect(() => assertNoSecretValues('payload with no secret', resolved)).not.toThrow()
+  })
+
+  test('an unset secret contributes no value to block (resolver returns undefined)', () => {
+    // If the bot token is unset in .env, its (absent) value cannot be leaked,
+    // and the guard must not block arbitrary text on its behalf.
+    const partial = buildSecretValueSet((d) => (d.name === 'SLACK_APP_TOKEN' ? APP : undefined))
+    expect(partial.size).toBe(1)
+    expect(() => assertNoSecretValues(BOT, partial)).not.toThrow()
+    expect(() => assertNoSecretValues(APP, partial)).toThrow(BLOCK_MSG)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Inbound secret-value scrub (ccsc-z0n.2) — buildSecretPlaceholderMap + redactSecretValues
+// ---------------------------------------------------------------------------
+
+describe('inbound secret-value scrub (ccsc-z0n.2)', () => {
+  // Non-token-shaped sentinels (the scrub is value-agnostic; no real shapes
+  // added to the repo — same discipline as the outbound-guard tests above).
+  const BOT = 'CCSC-TEST-BOT-SECRET-value-not-a-real-token'
+  const APP = 'CCSC-TEST-APP-SECRET-value-not-a-real-token'
+  const BOT_PH = secretPlaceholder('SLACK_BOT_TOKEN')
+  const APP_PH = secretPlaceholder('SLACK_APP_TOKEN')
+  const resolve = (d: SecretDeclaration): string | undefined =>
+    d.name === 'SLACK_BOT_TOKEN' ? BOT : d.name === 'SLACK_APP_TOKEN' ? APP : undefined
+
+  describe('buildSecretPlaceholderMap', () => {
+    test('maps each declared live value to that declaration’s placeholder', () => {
+      const map = buildSecretPlaceholderMap(resolve)
+      expect(map.get(BOT)).toBe(BOT_PH)
+      expect(map.get(APP)).toBe(APP_PH)
+      expect(map.size).toBe(2)
+    })
+
+    test('the mapped placeholder is exactly secretPlaceholder(name) — ties to ccsc-z0n.1', () => {
+      const map = buildSecretPlaceholderMap(resolve)
+      // Round-trips back to the declared name via the .1 inverse.
+      expect(secretNameFromPlaceholder(map.get(BOT)!)).toBe('SLACK_BOT_TOKEN')
+      expect(secretNameFromPlaceholder(map.get(APP)!)).toBe('SLACK_APP_TOKEN')
+    })
+
+    test('skips secrets with no resolved value', () => {
+      const map = buildSecretPlaceholderMap((d) => (d.name === 'SLACK_BOT_TOKEN' ? BOT : undefined))
+      expect(map.size).toBe(1)
+      expect(map.get(BOT)).toBe(BOT_PH)
+      const none = buildSecretPlaceholderMap(() => undefined)
+      expect(none.size).toBe(0)
+    })
+  })
+
+  describe('redactSecretValues', () => {
+    const map = buildSecretPlaceholderMap(resolve)
+
+    test('replaces a secret value with its placeholder and counts it', () => {
+      const { text, redactedCount } = redactSecretValues(`token is ${BOT} ok`, map)
+      expect(text).toBe(`token is ${BOT_PH} ok`)
+      expect(redactedCount).toBe(1)
+      expect(text).not.toContain(BOT)
+    })
+
+    test('replaces every occurrence of the same value', () => {
+      const { text, redactedCount } = redactSecretValues(`${BOT} and again ${BOT}`, map)
+      expect(redactedCount).toBe(2)
+      expect(text).toBe(`${BOT_PH} and again ${BOT_PH}`)
+    })
+
+    test('replaces multiple distinct values', () => {
+      const { text, redactedCount } = redactSecretValues(`${BOT} then ${APP}`, map)
+      expect(redactedCount).toBe(2)
+      expect(text).toBe(`${BOT_PH} then ${APP_PH}`)
+    })
+
+    test('clean text is returned unchanged with redactedCount 0', () => {
+      const { text, redactedCount } = redactSecretValues('a normal tool result', map)
+      expect(text).toBe('a normal tool result')
+      expect(redactedCount).toBe(0)
+    })
+
+    test('empty map is a no-op even for text that contains a value', () => {
+      const { text, redactedCount } = redactSecretValues(BOT, new Map())
+      expect(text).toBe(BOT)
+      expect(redactedCount).toBe(0)
+    })
+
+    test('empty / non-string text is a safe no-op', () => {
+      expect(redactSecretValues('', map)).toEqual({ text: '', redactedCount: 0 })
+      expect(redactSecretValues(undefined as unknown as string, map)).toEqual({
+        text: '',
+        redactedCount: 0,
+      })
+    })
+
+    test('an empty-string key never matches (would otherwise match everywhere)', () => {
+      const withEmpty = new Map<string, string>([
+        ['', 'SHOULD-NOT-APPEAR'],
+        [BOT, BOT_PH],
+      ])
+      const { text, redactedCount } = redactSecretValues('clean text', withEmpty)
+      expect(text).toBe('clean text')
+      expect(redactedCount).toBe(0)
+    })
+
+    test('seam: buildSecretPlaceholderMap → redactSecretValues swaps value for placeholder', () => {
+      // End-to-end mirror of how server.ts scrubs a tool result: the value the
+      // guard set knows becomes its declared placeholder; everything else is
+      // untouched.
+      const fileResult = `cat .env =>\nSLACK_APP_TOKEN=${APP}\n`
+      const { text, redactedCount } = redactSecretValues(fileResult, map)
+      expect(redactedCount).toBe(1)
+      expect(text).toBe(`cat .env =>\nSLACK_APP_TOKEN=${APP_PH}\n`)
+      expect(text).not.toContain(APP)
+    })
+  })
+})
 
 describe('assertSendable', () => {
   let root: string // tmp root that stands in for HOME
@@ -1690,6 +2422,45 @@ describe('sessionPath', () => {
 
   test('rejects empty channel component', () => {
     expect(() => sessionPath(tmpRoot, key('', 'T1.0'))).toThrow(/invalid channel component/)
+  })
+
+  // ── ccsc-kl410: per-user session isolation ─────────────────────────────
+
+  test('per-user key nests the file under a userId dir within the channel', () => {
+    const p = sessionPath(tmpRoot, { channel: 'C_CHAN', thread: 'T1.0', userId: 'U_ALICE' })
+    expect(p).toBe(join(tmpRoot, 'sessions', 'C_CHAN', 'U_ALICE', 'T1.0.json'))
+  })
+
+  test('two users in the same thread get distinct session files', () => {
+    const pA = sessionPath(tmpRoot, { channel: 'C_CHAN', thread: 'T1.0', userId: 'U_ALICE' })
+    const pB = sessionPath(tmpRoot, { channel: 'C_CHAN', thread: 'T1.0', userId: 'U_BOB' })
+    const shared = sessionPath(tmpRoot, key('C_CHAN', 'T1.0'))
+    expect(pA).not.toBe(pB)
+    expect(pA).not.toBe(shared)
+    expect(pB).not.toBe(shared)
+  })
+
+  test('undefined userId is the legacy shared path (unchanged)', () => {
+    const p = sessionPath(tmpRoot, key('C_CHAN', 'T1.0'))
+    expect(p).toBe(join(tmpRoot, 'sessions', 'C_CHAN', 'T1.0.json'))
+  })
+
+  test('rejects userId component that is exactly .. (path-injection guard)', () => {
+    expect(() => sessionPath(tmpRoot, { channel: 'C_CHAN', thread: 'T1.0', userId: '..' })).toThrow(
+      /invalid userId component/,
+    )
+  })
+
+  test('rejects userId component with /', () => {
+    expect(() =>
+      sessionPath(tmpRoot, { channel: 'C_CHAN', thread: 'T1.0', userId: 'U/X' }),
+    ).toThrow(/invalid userId component/)
+  })
+
+  test('rejects empty userId component (no collision with the shared session)', () => {
+    expect(() => sessionPath(tmpRoot, { channel: 'C_CHAN', thread: 'T1.0', userId: '' })).toThrow(
+      /invalid userId component/,
+    )
   })
 
   test('rejects thread component that is exactly ..', () => {
@@ -4905,6 +5676,2518 @@ describe('createSessionSupervisor.activate', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Cross-(channel, thread) session-state isolation (ccsc-1iw.1)
+//
+// Regression test for the peer-runtime footgun catalogued in
+// 000-docs/ADR-002 ("cross-thread reads default-ON"): the peer runtime shipped
+// a SANDBOX_CROSS_THREAD_READS=1 default that let one session read another's
+// state. CCSC's inversion is *structural* — the supervisor keys every read by
+// the inbound (channel, thread), and sessionPath() nests state under a
+// per-channel directory whose components are validated, so no key for one
+// thread can address another's file. THREAT-MODEL.md line 165 names the exact
+// threat ("cross-thread state injection" on sessions/*) and the exact
+// mitigation ("realpath-guarded sessionPath()"). These tests pin that
+// guarantee at the supervisor layer — the surface the running server actually
+// uses — and fail loudly if it ever regresses.
+//
+// SCOPE: the in-band adversary — the (channel, thread) *values* that ride in on
+// a Slack event (the prompt-injection vector). A same-UID local attacker who
+// can write the 0o700 single-writer state dir (e.g. plant a within-root symlink
+// sessions/A/X.json -> sessions/B/Y.json) is OUT OF SCOPE per THREAT-MODEL.md
+// T5 ("State-file tampering … Out of scope — this is a UID-trust boundary") and
+// R1 ("Same-UID host compromise. Out of scope"). So these tests deliberately do
+// NOT assert a guarantee against within-root symlinks: that path is unreachable
+// by the in-scope adversary, and asserting it would mis-state the threat model.
+// ---------------------------------------------------------------------------
+describe('cross-(channel,thread) session isolation (ccsc-1iw.1)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'session-isolation-'))
+    tmpRoot = realpathSync.native(rawRoot)
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => 1_700_000_000_000,
+    })
+  }
+
+  test('two sessions in different channels keep disjoint state (in-memory and on disk)', async () => {
+    const sup = makeSupervisor()
+    const a = await sup.activate({ channel: 'C_AAA', thread: 'T1' }, 'U_A')
+    const b = await sup.activate({ channel: 'C_BBB', thread: 'T1' }, 'U_B')
+
+    // Each session writes a distinct secret into ITS OWN data via the
+    // supervisor's serialised update() path.
+    await a.update((s) => ({ ...s, data: { ...s.data, secret: 'alpha' } }))
+    await b.update((s) => ({ ...s, data: { ...s.data, secret: 'bravo' } }))
+
+    // No bleed in the live handles…
+    expect(a.session.data.secret).toBe('alpha')
+    expect(b.session.data.secret).toBe('bravo')
+    expect(a.session.ownerId).toBe('U_A')
+    expect(b.session.ownerId).toBe('U_B')
+
+    // …nor on disk: each per-channel file holds only its own secret.
+    const onDiskA = JSON.parse(
+      readFileSync(sessionPath(tmpRoot, { channel: 'C_AAA', thread: 'T1' }), 'utf8'),
+    ) as Session
+    const onDiskB = JSON.parse(
+      readFileSync(sessionPath(tmpRoot, { channel: 'C_BBB', thread: 'T1' }), 'utf8'),
+    ) as Session
+    expect(onDiskA.data.secret).toBe('alpha')
+    expect(onDiskA.data).not.toHaveProperty('bravo')
+    expect(onDiskB.data.secret).toBe('bravo')
+  })
+
+  test('the same thread id in two channels resolves to two distinct sessions', async () => {
+    // A Slack thread ts is only unique within a channel; the same ts can occur
+    // in two channels. Channel scoping (sessionPath nests by channel; keyId
+    // uses a NUL separator) must keep them apart — never one shared file.
+    const sup = makeSupervisor()
+    const a = await sup.activate({ channel: 'C_AAA', thread: 'T_SHARED' }, 'U_A')
+    const b = await sup.activate({ channel: 'C_BBB', thread: 'T_SHARED' }, 'U_B')
+
+    expect(a).not.toBe(b)
+    await a.update((s) => ({ ...s, data: { ...s.data, mark: 'only-a' } }))
+    // b is a different session — A's write is invisible to it.
+    expect(b.session.data.mark).toBeUndefined()
+  })
+
+  test('per-user keys isolate two users in the same channel+thread (ccsc-kl410)', async () => {
+    // With perUserSessions, Alice and Bob share a Slack thread but get separate
+    // sessions — distinct keyId, distinct on-disk file, own ownerId.
+    const sup = makeSupervisor()
+    const alice = await sup.activate(
+      { channel: 'C_OPS', thread: 'T1', userId: 'U_ALICE' },
+      'U_ALICE',
+    )
+    const bob = await sup.activate({ channel: 'C_OPS', thread: 'T1', userId: 'U_BOB' }, 'U_BOB')
+
+    expect(alice).not.toBe(bob)
+    await alice.update((s) => ({ ...s, data: { ...s.data, secret: 'alice-only' } }))
+    await bob.update((s) => ({ ...s, data: { ...s.data, secret: 'bob-only' } }))
+
+    // No bleed in the live handles…
+    expect(alice.session.data.secret).toBe('alice-only')
+    expect(bob.session.data.secret).toBe('bob-only')
+    expect(alice.session.ownerId).toBe('U_ALICE')
+    expect(bob.session.ownerId).toBe('U_BOB')
+
+    // …nor on disk: each per-user file holds only its own secret.
+    const onDiskAlice = JSON.parse(
+      readFileSync(
+        sessionPath(tmpRoot, { channel: 'C_OPS', thread: 'T1', userId: 'U_ALICE' }),
+        'utf8',
+      ),
+    ) as Session
+    const onDiskBob = JSON.parse(
+      readFileSync(
+        sessionPath(tmpRoot, { channel: 'C_OPS', thread: 'T1', userId: 'U_BOB' }),
+        'utf8',
+      ),
+    ) as Session
+    expect(onDiskAlice.data.secret).toBe('alice-only')
+    expect(onDiskBob.data.secret).toBe('bob-only')
+  })
+
+  test('a per-user session does not collide with the shared (no-userId) session in one thread (ccsc-kl410)', async () => {
+    const sup = makeSupervisor()
+    const shared = await sup.activate({ channel: 'C_OPS', thread: 'T1' }, 'U_SHARED')
+    const peruser = await sup.activate(
+      { channel: 'C_OPS', thread: 'T1', userId: 'U_ALICE' },
+      'U_ALICE',
+    )
+    expect(shared).not.toBe(peruser)
+    await shared.update((s) => ({ ...s, data: { ...s.data, mark: 'shared' } }))
+    expect(peruser.session.data.mark).toBeUndefined()
+  })
+
+  test('an inbound thread value that embeds traversal toward another session is rejected before any read', async () => {
+    const sup = makeSupervisor()
+    // Seed a victim session the attacker would like to read.
+    const victim = await sup.activate({ channel: 'C_VICTIM', thread: 'TV' }, 'U_VICTIM')
+    await victim.update((s) => ({ ...s, data: { ...s.data, secret: 'victim-only' } }))
+
+    // The attacker controls the inbound thread value and tries to climb out of
+    // their own channel into the victim's file: '../C_VICTIM/TV'. Component
+    // validation in sessionPath() rejects the '/' (and '..') before any disk
+    // read happens, so activate() throws and no victim state is ever returned.
+    await expect(
+      sup.activate({ channel: 'C_ATTACKER', thread: '../C_VICTIM/TV' }, 'U_ATTACKER'),
+    ).rejects.toThrow(/invalid thread component/)
+
+    // Same defense via a crafted channel component.
+    await expect(
+      sup.activate({ channel: '../C_VICTIM', thread: 'TV' }, 'U_ATTACKER'),
+    ).rejects.toThrow(/invalid channel component/)
+
+    // The victim file is untouched and still readable only via its own key.
+    const onDisk = JSON.parse(
+      readFileSync(sessionPath(tmpRoot, { channel: 'C_VICTIM', thread: 'TV' }), 'utf8'),
+    ) as Session
+    expect(onDisk.data.secret).toBe('victim-only')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fencing lease (ccsc-o7x.1.1) — pure helpers
+// ---------------------------------------------------------------------------
+
+describe('lease helpers (ccsc-o7x.1.1)', () => {
+  const lease: Lease = { token: 7, owner: 'owner-A', heartbeatAt: 1_000_000 }
+
+  describe('resolveLeaseTtlMs', () => {
+    test('defaults when unset or empty', () => {
+      expect(resolveLeaseTtlMs({})).toBe(DEFAULT_LEASE_TTL_MS)
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: '' })).toBe(DEFAULT_LEASE_TTL_MS)
+    })
+    test('defaults on non-numeric / non-positive / non-finite', () => {
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: 'abc' })).toBe(DEFAULT_LEASE_TTL_MS)
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: '0' })).toBe(DEFAULT_LEASE_TTL_MS)
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: '-5' })).toBe(DEFAULT_LEASE_TTL_MS)
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: 'Infinity' })).toBe(
+        DEFAULT_LEASE_TTL_MS,
+      )
+    })
+    test('parses and floors a valid value', () => {
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: '5000' })).toBe(5000)
+      expect(resolveLeaseTtlMs({ SLACK_SESSION_LEASE_TTL_MS: '1500.9' })).toBe(1500)
+    })
+  })
+
+  describe('isLeaseStale', () => {
+    test('not stale within the window', () => {
+      expect(isLeaseStale(lease, lease.heartbeatAt + 500, 1000)).toBe(false)
+    })
+    test('not stale at exactly the TTL boundary (strict >)', () => {
+      expect(isLeaseStale(lease, lease.heartbeatAt + 1000, 1000)).toBe(false)
+    })
+    test('stale one ms past the window', () => {
+      expect(isLeaseStale(lease, lease.heartbeatAt + 1001, 1000)).toBe(true)
+    })
+  })
+
+  describe('heartbeatLease', () => {
+    test('advances heartbeatAt, preserves token + owner, does not mutate input', () => {
+      const renewed = heartbeatLease(lease, 2_000_000)
+      expect(renewed).toEqual({ token: 7, owner: 'owner-A', heartbeatAt: 2_000_000 })
+      expect(lease.heartbeatAt).toBe(1_000_000) // input untouched
+      expect(renewed).not.toBe(lease)
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fencing lease (ccsc-o7x.1.1) — supervisor integration
+// ---------------------------------------------------------------------------
+
+describe('createSessionSupervisor fencing lease (ccsc-o7x.1.1)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const TTL = 1000
+  const keyA = { channel: 'C_LEASE', thread: 'TA' }
+  const keyB = { channel: 'C_LEASE', thread: 'TB' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-lease-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: TTL,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  test('activation records a lease (token + owner + heartbeat-at)', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U_OWNER')
+    expect(handle.lease).not.toBeNull()
+    expect(handle.lease?.owner).toBe('OWNER-1')
+    expect(handle.lease?.heartbeatAt).toBe(nowValue)
+    expect(typeof handle.lease?.token).toBe('number')
+  })
+
+  test('tokens are monotonic across owners', async () => {
+    const sup = makeSupervisor()
+    const a = await sup.activate(keyA, 'U')
+    const b = await sup.activate(keyB, 'U')
+    expect(b.lease!.token).toBeGreaterThan(a.lease!.token)
+  })
+
+  test('heartbeat renews the lease when the token matches', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    const token = handle.lease!.token
+    const t0 = handle.lease!.heartbeatAt
+
+    nowValue += 500
+    expect(handle.heartbeat(token)).toBe(true)
+    expect(handle.lease!.heartbeatAt).toBe(t0 + 500)
+    expect(handle.lease!.token).toBe(token) // token unchanged by heartbeat
+  })
+
+  test('heartbeat with a superseded token does not renew', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    const t0 = handle.lease!.heartbeatAt
+
+    nowValue += 500
+    expect(handle.heartbeat(handle.lease!.token + 999)).toBe(false)
+    expect(handle.lease!.heartbeatAt).toBe(t0) // unchanged
+  })
+
+  test('fenced write succeeds with the live token on a fresh lease', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    await expect(
+      handle.update((s) => ({ ...s, data: { ...s.data, n: 1 } }), handle.lease!.token),
+    ).resolves.toBeUndefined()
+    expect((handle.session.data as Record<string, unknown>).n).toBe(1)
+  })
+
+  test('fenced write is rejected when the token has been superseded', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    const before = handle.session
+    await expect(
+      handle.update((s) => ({ ...s, data: { ...s.data, n: 2 } }), handle.lease!.token + 999),
+    ).rejects.toThrow(/fenced/)
+    expect(handle.session).toBe(before) // nothing persisted
+  })
+
+  test('fenced write is rejected when the lease heartbeat has lapsed', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    const token = handle.lease!.token
+    const before = handle.session
+
+    nowValue += TTL + 1 // lapse the lease without heartbeating
+    await expect(
+      handle.update((s) => ({ ...s, data: { ...s.data, n: 3 } }), token),
+    ).rejects.toThrow(/lapsed/)
+    expect(handle.session).toBe(before)
+  })
+
+  test('a renewed heartbeat un-lapses the lease so the fenced write succeeds', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    const token = handle.lease!.token
+
+    nowValue += TTL + 1 // would be stale...
+    expect(handle.heartbeat(token)).toBe(true) // ...but we renew at the new now
+    await expect(
+      handle.update((s) => ({ ...s, data: { ...s.data, n: 4 } }), token),
+    ).resolves.toBeUndefined()
+    expect((handle.session.data as Record<string, unknown>).n).toBe(4)
+  })
+
+  test('an unfenced update still works regardless of lease (backward compatible)', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(keyA, 'U')
+    nowValue += TTL + 1 // lease is stale, but no fenceToken passed
+    await expect(
+      handle.update((s) => ({ ...s, data: { ...s.data, n: 5 } })),
+    ).resolves.toBeUndefined()
+    expect((handle.session.data as Record<string, unknown>).n).toBe(5)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Crash-recovery sweep (ccsc-o7x.1.2)
+// ---------------------------------------------------------------------------
+
+describe('classifyRecovery (ccsc-o7x.1.2)', () => {
+  const turn = (heartbeatAt: number): InFlightTurn => ({
+    owner: 'O',
+    token: 1,
+    startedAt: heartbeatAt,
+    heartbeatAt,
+  })
+
+  test('resumable when the heartbeat has lapsed past the TTL', () => {
+    expect(classifyRecovery(turn(1000), 1000 + 1001, 1000)).toBe('resumable')
+  })
+  test('orphaned when the heartbeat is still fresh (within TTL)', () => {
+    expect(classifyRecovery(turn(1000), 1000 + 500, 1000)).toBe('orphaned')
+  })
+  test('orphaned at exactly the TTL boundary (strict >, mirrors isLeaseStale)', () => {
+    expect(classifyRecovery(turn(1000), 1000 + 1000, 1000)).toBe('orphaned')
+  })
+})
+
+describe('createSessionSupervisor recovery sweep (ccsc-o7x.1.2)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  let journalEvents: Array<{ kind: string }>
+  const TTL = 1000
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-recovery-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+    journalEvents = []
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: TTL,
+      ownerId: 'OWNER-NEW',
+      journal: {
+        writeEvent: async (e: { kind: string }) => {
+          journalEvents.push(e)
+          return {}
+        },
+      } as unknown as import('./journal.ts').JournalWriter,
+    })
+  }
+
+  async function seed(key: SessionKey, inFlightTurn?: InFlightTurn): Promise<void> {
+    const s: Session = {
+      v: 1,
+      key,
+      createdAt: nowValue - 1_000_000,
+      lastActiveAt: nowValue - 1_000_000,
+      ownerId: 'U',
+      data: {},
+      ...(inFlightTurn ? { inFlightTurn } : {}),
+    }
+    await saveSession(sessionPath(tmpRoot, key), s)
+  }
+
+  test('clean state dir → zero report, no recovery journal events', async () => {
+    const sup = makeSupervisor()
+    const report = await sup.recoverOnStartup()
+    expect(report).toEqual({ scanned: 0, requeued: [], orphaned: [] })
+    expect(journalEvents.filter((e) => e.kind.startsWith('session.recovery'))).toHaveLength(0)
+  })
+
+  test('a clean session (no marker) is scanned but neither requeued nor orphaned', async () => {
+    const key = { channel: 'C_REC', thread: 'clean' }
+    await seed(key)
+    const sup = makeSupervisor()
+    const report = await sup.recoverOnStartup()
+    expect(report.scanned).toBe(1)
+    expect(report.requeued).toHaveLength(0)
+    expect(report.orphaned).toHaveLength(0)
+  })
+
+  test('a stale in-flight marker is requeued — marker cleared on disk + journaled', async () => {
+    const key = { channel: 'C_REC', thread: 'stale' }
+    await seed(key, { owner: 'OLD', token: 3, startedAt: 0, heartbeatAt: nowValue - (TTL + 1) })
+    const sup = makeSupervisor()
+
+    const report = await sup.recoverOnStartup()
+    expect(report.requeued).toEqual([key])
+    expect(report.orphaned).toHaveLength(0)
+
+    // Marker cleared on disk.
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.inFlightTurn).toBeUndefined()
+    // Journaled exactly one requeued event.
+    expect(journalEvents.filter((e) => e.kind === 'session.recovery.requeued')).toHaveLength(1)
+
+    // A requeued session re-activates cleanly.
+    await expect(sup.activate(key, 'U')).resolves.toBeDefined()
+  })
+
+  test('a fresh in-flight marker is orphaned — quarantined + journaled, activate rejects', async () => {
+    const key = { channel: 'C_REC', thread: 'fresh' }
+    await seed(key, { owner: 'OLD', token: 4, startedAt: 0, heartbeatAt: nowValue - 100 })
+    const sup = makeSupervisor()
+
+    const report = await sup.recoverOnStartup()
+    expect(report.orphaned).toEqual([key])
+    expect(report.requeued).toHaveLength(0)
+    expect(journalEvents.filter((e) => e.kind === 'session.recovery.orphaned')).toHaveLength(1)
+
+    // Orphaned → quarantined → activate now rejects.
+    await expect(sup.activate(key, 'U')).rejects.toThrow()
+  })
+
+  test('seeds the lease-token counter above the highest persisted token', async () => {
+    const key = { channel: 'C_REC', thread: 'tok' }
+    await seed(key, { owner: 'OLD', token: 50, startedAt: 0, heartbeatAt: nowValue - (TTL + 1) })
+    const sup = makeSupervisor()
+    await sup.recoverOnStartup() // seeds nextLeaseToken to 50
+
+    // A fresh activation on a different key must mint a token strictly above 50,
+    // so a restarted process never re-issues a crashed owner's token.
+    const handle = await sup.activate({ channel: 'C_REC', thread: 'newkey' }, 'U')
+    expect(handle.lease!.token).toBeGreaterThan(50)
+  })
+
+  test('a file that loads-strict-rejects is orphaned (unreadable branch)', async () => {
+    // listSessions summarises it (createdAt/lastActiveAt/ownerId valid), but
+    // loadSession's strict schema rejects the malformed inFlightTurn.owner.
+    const key = { channel: 'C_REC', thread: 'bad' }
+    const p = sessionPath(tmpRoot, key)
+    mkdirSync(join(tmpRoot, 'sessions', 'C_REC'), { recursive: true })
+    writeFileSync(
+      p,
+      JSON.stringify({
+        v: 1,
+        key,
+        createdAt: nowValue,
+        lastActiveAt: nowValue,
+        ownerId: 'U',
+        data: {},
+        inFlightTurn: { owner: 12345, token: 1, startedAt: 0, heartbeatAt: 0 },
+      }),
+    )
+    const sup = makeSupervisor()
+    const report = await sup.recoverOnStartup()
+    expect(report.orphaned).toEqual([key])
+    expect(journalEvents.filter((e) => e.kind === 'session.recovery.orphaned')).toHaveLength(1)
+  })
+
+  test('classifies multiple sessions independently in one sweep', async () => {
+    await seed({ channel: 'C_M', thread: 'a' }) // clean
+    await seed(
+      { channel: 'C_M', thread: 'b' },
+      { owner: 'O', token: 1, startedAt: 0, heartbeatAt: nowValue - (TTL + 1) },
+    ) // stale → requeue
+    await seed(
+      { channel: 'C_M', thread: 'c' },
+      { owner: 'O', token: 2, startedAt: 0, heartbeatAt: nowValue - 10 },
+    ) // fresh → orphan
+    const sup = makeSupervisor()
+    const report = await sup.recoverOnStartup()
+    expect(report.scanned).toBe(3)
+    expect(report.requeued).toHaveLength(1)
+    expect(report.orphaned).toHaveLength(1)
+  })
+})
+
+describe('SessionHandle.recordTurnStart / recordTurnEnd (ccsc-o7x.1.2)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_TURN', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-turn-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  test('recordTurnStart persists an in-flight marker (owner+token+startedAt+heartbeatAt)', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    const token = handle.lease!.token
+
+    await handle.recordTurnStart(token)
+    expect(handle.session.inFlightTurn).toEqual({
+      owner: 'OWNER-1',
+      token,
+      startedAt: nowValue,
+      heartbeatAt: nowValue,
+    })
+    // Persisted on disk.
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.inFlightTurn?.token).toBe(token)
+  })
+
+  test('recordTurnStart rejects when the token is not the current lease', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await expect(handle.recordTurnStart(handle.lease!.token + 999)).rejects.toThrow(
+      /does not match the current lease/,
+    )
+    expect(handle.session.inFlightTurn).toBeUndefined()
+  })
+
+  test('recordTurnEnd clears the marker', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    const token = handle.lease!.token
+    await handle.recordTurnStart(token)
+    expect(handle.session.inFlightTurn).toBeDefined()
+
+    await handle.recordTurnEnd()
+    expect(handle.session.inFlightTurn).toBeUndefined()
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.inFlightTurn).toBeUndefined()
+  })
+
+  test('round-trip: recordTurnStart → crash → fresh supervisor sweep requeues the lapsed turn', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await handle.recordTurnStart(handle.lease!.token)
+
+    // Simulate a crash: drop the supervisor, advance the clock past the TTL,
+    // and bring up a fresh supervisor against the same state dir.
+    nowValue += 5000
+    const recovered = createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-2',
+    })
+    const report = await recovered.recoverOnStartup()
+    expect(report.requeued).toEqual([key])
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.inFlightTurn).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Lease-loss → quarantine (ccsc-o7x.1.3)
+// ---------------------------------------------------------------------------
+
+describe('lease-loss quarantine (ccsc-o7x.1.3)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const TTL = 1000
+  const key = { channel: 'C_QL', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-leaseloss-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: TTL,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  test('a fenced write with a superseded token quarantines the handle', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await expect(
+      handle.update((s) => ({ ...s, data: { x: 1 } }), handle.lease!.token + 999),
+    ).rejects.toThrow(/lease lost/)
+    expect(handle.state).toBe('quarantined')
+  })
+
+  test('a fenced write whose lease has lapsed quarantines the handle', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    const token = handle.lease!.token
+    nowValue += TTL + 1 // lapse without heartbeating
+    await expect(handle.update((s) => ({ ...s, data: { x: 2 } }), token)).rejects.toThrow(/lapsed/)
+    expect(handle.state).toBe('quarantined')
+  })
+
+  test('a quarantined turn performs no further work — even an unfenced update rejects', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    // Lose the lease.
+    await expect(handle.update((s) => s, handle.lease!.token + 999)).rejects.toThrow(/quarantined/)
+    // Any subsequent write — fenced or not — is refused.
+    await expect(handle.update((s) => ({ ...s, data: { y: 1 } }))).rejects.toThrow(/quarantined/)
+  })
+
+  test('a lease-lost session is excluded from the active set (activate rejects until cleared)', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await expect(handle.update((s) => s, handle.lease!.token + 999)).rejects.toThrow()
+    expect(handle.state).toBe('quarantined')
+
+    // Removed from live + recorded in quarantine ⇒ re-activation rejects.
+    await expect(sup.activate(key, 'U')).rejects.toThrow()
+
+    // Operator clears the quarantine ⇒ activation succeeds again with a fresh lease.
+    sup.clearQuarantine(key)
+    const reactivated = await sup.activate(key, 'U')
+    expect(reactivated.state).toBe('active')
+    expect(reactivated.lease).not.toBeNull()
+  })
+
+  test('the idle reaper leaves a quarantined session alone', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await expect(handle.update((s) => s, handle.lease!.token + 999)).rejects.toThrow()
+    // Advancing well past any idle threshold must not let the reaper touch it.
+    nowValue += 10 * 60 * 60 * 1000
+    await expect(sup.reapIdle()).resolves.toBeUndefined()
+    expect(handle.state).toBe('quarantined')
+  })
+
+  test('a healthy fenced write (live token, fresh lease) does NOT quarantine', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await expect(
+      handle.update((s) => ({ ...s, data: { ok: 1 } }), handle.lease!.token),
+    ).resolves.toBeUndefined()
+    expect(handle.state).toBe('active')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Reply-delivery outbox — record obligation (ccsc-o7x.2.1)
+// ---------------------------------------------------------------------------
+
+describe('reply-delivery outbox (ccsc-o7x.2.1)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_OBX', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-outbox-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  const reply = { id: 'd-1', channel: 'C_OBX', thread: 'T1', payload: 'hello' }
+
+  test('recordTerminalDelivery persists a pending obligation (stamps attempts/state/createdAt)', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await handle.recordTerminalDelivery(handle.lease!.token, reply)
+
+    expect(handle.session.outbox).toEqual([
+      {
+        id: 'd-1',
+        channel: 'C_OBX',
+        thread: 'T1',
+        payload: 'hello',
+        attempts: 0,
+        state: 'pending',
+        createdAt: nowValue,
+      },
+    ])
+    // Persisted on disk.
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.id).toBe('d-1')
+  })
+
+  test('records the obligation atomically with the terminal marker — one write clears inFlightTurn AND appends', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    const token = handle.lease!.token
+    await handle.recordTurnStart(token)
+    expect(handle.session.inFlightTurn).toBeDefined()
+
+    await handle.recordTerminalDelivery(token, reply)
+    // Same write: marker gone, obligation present.
+    expect(handle.session.inFlightTurn).toBeUndefined()
+    expect(handle.session.outbox).toHaveLength(1)
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.inFlightTurn).toBeUndefined()
+    expect(reloaded.outbox).toHaveLength(1)
+  })
+
+  test('recordTerminalDelivery is fenced — a superseded token rejects and writes nothing', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await expect(handle.recordTerminalDelivery(handle.lease!.token + 999, reply)).rejects.toThrow(
+      /fenced|lease lost/,
+    )
+    expect(handle.session.outbox).toBeUndefined()
+  })
+
+  test('multiple terminal deliveries accumulate in the outbox', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    const token = handle.lease!.token
+    await handle.recordTerminalDelivery(token, { ...reply, id: 'd-1' })
+    await handle.recordTerminalDelivery(token, { ...reply, id: 'd-2' })
+    expect(handle.session.outbox?.map((o) => o.id)).toEqual(['d-1', 'd-2'])
+  })
+
+  // -- recordTerminalDeliveries — batch sibling for chunked replies (ccsc-o7x.4)
+
+  test('recordTerminalDeliveries appends all chunks in ONE atomic write, clearing the in-flight marker', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    const token = handle.lease!.token
+    await handle.recordTurnStart(token)
+    expect(handle.session.inFlightTurn).toBeDefined()
+
+    await handle.recordTerminalDeliveries(token, [
+      { id: 'r-1:0', channel: 'C_OBX', thread: 'T1', payload: 'a' },
+      { id: 'r-1:1', channel: 'C_OBX', thread: 'T1', payload: 'b' },
+      { id: 'r-1:2', channel: 'C_OBX', thread: 'T1', payload: 'c' },
+    ])
+
+    // One write: marker gone AND all three obligations present, in order.
+    expect(handle.session.inFlightTurn).toBeUndefined()
+    expect(handle.session.outbox?.map((o) => [o.id, o.payload, o.state])).toEqual([
+      ['r-1:0', 'a', 'pending'],
+      ['r-1:1', 'b', 'pending'],
+      ['r-1:2', 'c', 'pending'],
+    ])
+    // Persisted on disk.
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.inFlightTurn).toBeUndefined()
+    expect(reloaded.outbox?.map((o) => o.id)).toEqual(['r-1:0', 'r-1:1', 'r-1:2'])
+  })
+
+  test('recordTerminalDeliveries is fenced — a superseded token rejects and writes nothing (all-or-nothing)', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await expect(
+      handle.recordTerminalDeliveries(handle.lease!.token + 999, [
+        { id: 'r-1:0', channel: 'C_OBX', thread: 'T1', payload: 'a' },
+        { id: 'r-1:1', channel: 'C_OBX', thread: 'T1', payload: 'b' },
+      ]),
+    ).rejects.toThrow(/fenced|lease lost/)
+    // Not a single chunk leaked through.
+    expect(handle.session.outbox).toBeUndefined()
+  })
+
+  test('pendingDeliveries returns pending obligations across sessions', async () => {
+    const sup = makeSupervisor()
+    const h1 = await sup.activate({ channel: 'C_OBX', thread: 'a' }, 'U')
+    await h1.recordTerminalDelivery(h1.lease!.token, { ...reply, id: 'a-1', thread: 'a' })
+    const h2 = await sup.activate({ channel: 'C_OBX', thread: 'b' }, 'U')
+    await h2.recordTerminalDelivery(h2.lease!.token, { ...reply, id: 'b-1', thread: 'b' })
+
+    const pending = await sup.pendingDeliveries()
+    expect(pending.map((o) => o.id).sort()).toEqual(['a-1', 'b-1'])
+  })
+
+  test('a crash after terminal-but-before-send leaves a pending obligation a fresh supervisor sees', async () => {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await handle.recordTerminalDelivery(handle.lease!.token, reply)
+
+    // Simulate a crash before the send: drop the supervisor, bring up a fresh
+    // one against the same state dir. The obligation is still pending.
+    const recovered = makeSupervisor()
+    const pending = await recovered.pendingDeliveries()
+    expect(pending).toHaveLength(1)
+    expect(pending[0]?.id).toBe('d-1')
+  })
+
+  test('pendingDeliveries excludes non-pending obligations and clean sessions', async () => {
+    // Seed a session whose obligation is already delivered — must be excluded.
+    const delivered: DeliveryObligation = {
+      id: 'gone',
+      channel: 'C_OBX',
+      thread: 'done',
+      payload: 'x',
+      attempts: 1,
+      state: 'delivered',
+      createdAt: nowValue,
+    }
+    const s: Session = {
+      v: 1,
+      key: { channel: 'C_OBX', thread: 'done' },
+      createdAt: nowValue,
+      lastActiveAt: nowValue,
+      ownerId: 'U',
+      data: {},
+      outbox: [delivered],
+    }
+    await saveSession(sessionPath(tmpRoot, { channel: 'C_OBX', thread: 'done' }), s)
+    // And a clean session with no outbox at all.
+    const clean: Session = {
+      v: 1,
+      key: { channel: 'C_OBX', thread: 'clean' },
+      createdAt: nowValue,
+      lastActiveAt: nowValue,
+      ownerId: 'U',
+      data: {},
+    }
+    await saveSession(sessionPath(tmpRoot, { channel: 'C_OBX', thread: 'clean' }), clean)
+
+    const sup = makeSupervisor()
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('pendingDeliveries on an empty state dir returns []', async () => {
+    const sup = makeSupervisor()
+    expect(await sup.pendingDeliveries()).toEqual([])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Delivery classification + backoff — pure helpers (ccsc-o7x.2.2)
+// ---------------------------------------------------------------------------
+
+describe('delivery error classification (ccsc-o7x.2.2)', () => {
+  test('known permanent Slack codes classify non-retryable', () => {
+    for (const code of [
+      'channel_not_found',
+      'not_in_channel',
+      'is_archived',
+      'invalid_auth',
+      'account_inactive',
+      'token_revoked',
+      'no_permission',
+      'msg_too_long',
+      'no_text',
+      'restricted_action',
+      'cannot_dm_bot',
+    ]) {
+      expect(classifyDeliveryError(code)).toBe('non-retryable')
+    }
+  })
+
+  test('transient / unknown / undefined codes default to retryable', () => {
+    expect(classifyDeliveryError('rate_limited')).toBe('retryable')
+    expect(classifyDeliveryError('internal_error')).toBe('retryable')
+    expect(classifyDeliveryError('service_unavailable')).toBe('retryable')
+    expect(classifyDeliveryError('ECONNRESET')).toBe('retryable')
+    expect(classifyDeliveryError('slack_webapi_rate_limited_error')).toBe('retryable')
+    expect(classifyDeliveryError('some_brand_new_code')).toBe('retryable')
+    expect(classifyDeliveryError(undefined)).toBe('retryable')
+  })
+
+  test('NON_RETRYABLE_SLACK_ERRORS holds the permanent codes and excludes rate_limited', () => {
+    expect(NON_RETRYABLE_SLACK_ERRORS.has('channel_not_found')).toBe(true)
+    expect(NON_RETRYABLE_SLACK_ERRORS.has('invalid_auth')).toBe(true)
+    expect(NON_RETRYABLE_SLACK_ERRORS.has('rate_limited')).toBe(false)
+  })
+})
+
+describe('extractSlackErrorCode (ccsc-o7x.2.2)', () => {
+  test('prefers err.data.error (the canonical Slack Web API code)', () => {
+    expect(extractSlackErrorCode({ data: { error: 'channel_not_found' } })).toBe(
+      'channel_not_found',
+    )
+    // A real @slack/web-api WebAPIPlatformError shape: Error + .data.error.
+    const platformErr = Object.assign(new Error('An API error occurred'), {
+      code: 'slack_webapi_platform_error',
+      data: { ok: false, error: 'not_in_channel' },
+    })
+    expect(extractSlackErrorCode(platformErr)).toBe('not_in_channel')
+  })
+
+  test('falls back to err.code when no data.error is present', () => {
+    expect(extractSlackErrorCode({ code: 'slack_webapi_rate_limited_error' })).toBe(
+      'slack_webapi_rate_limited_error',
+    )
+    expect(
+      extractSlackErrorCode(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })),
+    ).toBe('ECONNRESET')
+  })
+
+  test('returns undefined for non-object throws and empty/absent codes', () => {
+    expect(extractSlackErrorCode(undefined)).toBeUndefined()
+    expect(extractSlackErrorCode(null)).toBeUndefined()
+    expect(extractSlackErrorCode('a string')).toBeUndefined()
+    expect(extractSlackErrorCode(new Error('plain'))).toBeUndefined()
+    expect(extractSlackErrorCode({ data: { error: '' } })).toBeUndefined()
+    expect(extractSlackErrorCode({ code: '' })).toBeUndefined()
+  })
+})
+
+describe('computeBackoffMs (ccsc-o7x.2.2)', () => {
+  test('no wait before the first attempt', () => {
+    expect(computeBackoffMs(0)).toBe(0)
+    expect(computeBackoffMs(-3)).toBe(0)
+  })
+
+  test('exponential growth with the defaults (250ms base, x2)', () => {
+    expect(computeBackoffMs(1)).toBe(250)
+    expect(computeBackoffMs(2)).toBe(500)
+    expect(computeBackoffMs(3)).toBe(1000)
+    expect(computeBackoffMs(4)).toBe(2000)
+  })
+
+  test('clamps to maxMs and honors custom tunables', () => {
+    expect(computeBackoffMs(100)).toBe(30_000) // default cap
+    expect(computeBackoffMs(3, { baseMs: 100, factor: 3, maxMs: 10_000 })).toBe(900)
+    expect(computeBackoffMs(10, { baseMs: 100, factor: 3, maxMs: 10_000 })).toBe(10_000)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Delivery poller — drainOutbox (ccsc-o7x.2.2)
+// ---------------------------------------------------------------------------
+
+describe('delivery poller drainOutbox (ccsc-o7x.2.2)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_POLL', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-poller-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  const reply = { id: 'd-1', channel: 'C_POLL', thread: 'T1', payload: 'hello' }
+
+  /** Supersede a handle's lease in place to simulate a newer owner taking over —
+   *  the only way to drive `heartbeat(oldToken) === false` through a realistic
+   *  path (a fresh activation by a new owner re-acquires the lease). */
+  function supersedeLease(handle: SessionHandle, owner: string, token: number): void {
+    ;(handle as unknown as { acquireLease(o: string, t: number): Lease }).acquireLease(owner, token)
+  }
+
+  /** A Slack-shaped error carrying a canonical Web API code. */
+  function slackError(code: string): Error {
+    return Object.assign(new Error(`slack: ${code}`), { data: { ok: false, error: code } })
+  }
+
+  async function seedObligation(over: Partial<typeof reply> = {}): Promise<void> {
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key, 'U')
+    await handle.recordTerminalDelivery(handle.lease!.token, { ...reply, ...over })
+  }
+
+  test('empty outbox → zero report, send never called', async () => {
+    const sup = makeSupervisor()
+    let calls = 0
+    const report = await sup.drainOutbox(async () => {
+      calls++
+    })
+    expect(report).toEqual({ scanned: 0, delivered: [], deadLettered: [], skipped: [] })
+    expect(calls).toBe(0)
+  })
+
+  test('successful send marks the obligation delivered and clears it from pending', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    const sent: DeliveryObligation[] = []
+    const report = await sup.drainOutbox(async (ob) => {
+      sent.push(ob)
+    })
+
+    expect(sent.map((o) => o.id)).toEqual(['d-1'])
+    expect(report.scanned).toBe(1)
+    expect(report.delivered).toEqual(['d-1'])
+    expect(report.deadLettered).toEqual([])
+    expect(report.skipped).toEqual([])
+
+    // Persisted: state delivered, attempts incremented, no lastError on success.
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('delivered')
+    expect(reloaded.outbox?.[0]?.attempts).toBe(1)
+    expect(reloaded.outbox?.[0]?.lastError).toBeUndefined()
+    // No longer pending.
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('non-retryable Slack error dead-letters immediately with the error recorded (no retry)', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    const delays: number[] = []
+    let calls = 0
+    const report = await sup.drainOutbox(
+      async () => {
+        calls++
+        throw slackError('channel_not_found')
+      },
+      { delayMs: async (ms) => void delays.push(ms) },
+    )
+
+    expect(calls).toBe(1) // no retry on a permanent error
+    expect(delays).toEqual([]) // never backed off
+    expect(report.delivered).toEqual([])
+    expect(report.deadLettered).toEqual([{ id: 'd-1', error: 'channel_not_found' }])
+
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('dead')
+    expect(reloaded.outbox?.[0]?.attempts).toBe(1)
+    expect(reloaded.outbox?.[0]?.lastError).toBe('channel_not_found')
+  })
+
+  test('retryable error retries with exponential backoff up to the cap, then dead-letters', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    const delays: number[] = []
+    let calls = 0
+    const report = await sup.drainOutbox(
+      async () => {
+        calls++
+        throw slackError('rate_limited') // always fails, always retryable
+      },
+      { maxAttempts: 3, delayMs: async (ms) => void delays.push(ms) },
+    )
+
+    expect(calls).toBe(3) // attempts capped
+    expect(delays).toEqual([250, 500]) // backoff before retries 2 and 3
+    expect(report.deadLettered).toEqual([{ id: 'd-1', error: 'rate_limited' }])
+
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('dead')
+    expect(reloaded.outbox?.[0]?.attempts).toBe(3)
+    expect(reloaded.outbox?.[0]?.lastError).toBe('rate_limited')
+  })
+
+  test('retryable error that recovers is delivered (no dead-letter)', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    const delays: number[] = []
+    let calls = 0
+    const report = await sup.drainOutbox(
+      async () => {
+        calls++
+        if (calls < 2) throw slackError('service_unavailable')
+      },
+      { delayMs: async (ms) => void delays.push(ms) },
+    )
+
+    expect(calls).toBe(2) // failed once, succeeded on the retry
+    expect(delays).toEqual([250]) // one backoff
+    expect(report.delivered).toEqual(['d-1'])
+    expect(report.deadLettered).toEqual([])
+
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('delivered')
+    expect(reloaded.outbox?.[0]?.attempts).toBe(2)
+    // lastError is not retained on a delivered record.
+    expect(reloaded.outbox?.[0]?.lastError).toBeUndefined()
+  })
+
+  test('default attempt cap is DEFAULT_MAX_DELIVERY_ATTEMPTS', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    let calls = 0
+    await sup.drainOutbox(
+      async () => {
+        calls++
+        throw slackError('internal_error')
+      },
+      { delayMs: async () => {} },
+    )
+    expect(calls).toBe(DEFAULT_MAX_DELIVERY_ATTEMPTS)
+  })
+
+  test('lease contention: a lease superseded mid-retry yields without a second send (no double-send)', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key) // same cached handle the poller will use
+    const token = handle.lease!.token
+
+    let calls = 0
+    const report = await sup.drainOutbox(
+      async () => {
+        calls++
+        throw slackError('rate_limited') // retryable → would normally retry
+      },
+      {
+        // During the first backoff a newer owner takes the lease. The next
+        // iteration's pre-send heartbeat check fails → the poller yields.
+        delayMs: async () => {
+          supersedeLease(handle, 'OWNER-2', token + 100)
+        },
+      },
+    )
+
+    expect(calls).toBe(1) // sent once, then yielded — never double-sent
+    expect(report.delivered).toEqual([])
+    expect(report.deadLettered).toEqual([])
+    expect(report.skipped).toEqual(['d-1'])
+
+    // Obligation is left pending for the live owner.
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('pending')
+  })
+
+  test('lease contention: a lease superseded before the persist yields without committing (delivery not marked)', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    const handle = await sup.activate(key)
+    const token = handle.lease!.token
+
+    let calls = 0
+    const report = await sup.drainOutbox(async () => {
+      calls++
+      // The send itself "succeeds", but a newer owner takes the lease before the
+      // persist. The pre-persist lease check yields → the obligation is not
+      // marked delivered (and the session is NOT quarantined).
+      supersedeLease(handle, 'OWNER-2', token + 100)
+    })
+
+    expect(calls).toBe(1)
+    expect(report.delivered).toEqual([])
+    expect(report.skipped).toEqual(['d-1'])
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('pending') // still owed, for 2.3 to dedup
+    // The legitimate new owner is not locked out — the key was not quarantined.
+    expect(reloaded.outbox?.[0]?.attempts).toBe(0)
+  })
+
+  test('drains obligations across multiple sessions independently', async () => {
+    const seed = makeSupervisor()
+    const ha = await seed.activate({ channel: 'C_POLL', thread: 'a' }, 'U')
+    await ha.recordTerminalDelivery(ha.lease!.token, { ...reply, id: 'a-1', thread: 'a' })
+    const hb = await seed.activate({ channel: 'C_POLL', thread: 'b' }, 'U')
+    await hb.recordTerminalDelivery(hb.lease!.token, { ...reply, id: 'b-1', thread: 'b' })
+
+    const sup = makeSupervisor()
+    const sentIds: string[] = []
+    const report = await sup.drainOutbox(
+      async (ob) => {
+        if (ob.id === 'b-1') throw slackError('not_in_channel') // one fails permanently
+        sentIds.push(ob.id)
+      },
+      { delayMs: async () => {} },
+    )
+
+    expect(report.scanned).toBe(2)
+    expect(report.delivered).toEqual(['a-1'])
+    expect(report.deadLettered).toEqual([{ id: 'b-1', error: 'not_in_channel' }])
+    expect(sentIds).toEqual(['a-1'])
+  })
+
+  test('a corrupt/unreadable session file is skipped, never throwing', async () => {
+    // Seed an obligation, then corrupt the file. The outbox scan skips an
+    // unreadable session (the recovery sweep is the path that quarantines it),
+    // so the drain neither sees the obligation nor throws.
+    await seedObligation()
+    writeFileSync(sessionPath(tmpRoot, key), 'not json at all', 'utf8')
+
+    const sup = makeSupervisor()
+    let calls = 0
+    const report = await sup.drainOutbox(async () => {
+      calls++
+    })
+
+    // pendingDeliveries skips the unreadable file, so nothing is scanned.
+    expect(report.scanned).toBe(0)
+    expect(calls).toBe(0)
+  })
+
+  test('a second pass does not re-process delivered/dead obligations', async () => {
+    await seedObligation()
+    const sup = makeSupervisor()
+    await sup.drainOutbox(async () => {}) // first pass delivers d-1
+
+    let calls = 0
+    const report = await sup.drainOutbox(async () => {
+      calls++
+    })
+    expect(report.scanned).toBe(0) // d-1 is delivered, no longer pending
+    expect(calls).toBe(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Idempotent redelivery — makeIdempotentSend (ccsc-o7x.2.3)
+// ---------------------------------------------------------------------------
+
+interface FakePost {
+  key: string
+  channel: string
+  thread: string
+  payload: string
+}
+
+/** A fake Slack the idempotent send posts into, keyed by idempotency key. With
+ *  `failFirstPostAfterStoring` the first post LANDS the message then throws —
+ *  simulating an ack lost after Slack already accepted the post (the ambiguous
+ *  failure idempotency must survive). */
+function makeFakeSlack(opts: { failFirstPostAfterStoring?: boolean } = {}): {
+  store: FakePost[]
+  deps: IdempotentSendDeps
+  postCalls: () => number
+  findCalls: () => { channel: string; thread: string; key: string }[]
+} {
+  const store: FakePost[] = []
+  const finds: { channel: string; thread: string; key: string }[] = []
+  let postCalls = 0
+  const deps: IdempotentSendDeps = {
+    findDelivered: async (channel, thread, key) => {
+      finds.push({ channel, thread, key })
+      const hit = store.find((m) => m.key === key && m.channel === channel && m.thread === thread)
+      return hit ? `ts-${key}` : null
+    },
+    post: async (ob, key) => {
+      postCalls++
+      store.push({ key, channel: ob.channel, thread: ob.thread, payload: ob.payload })
+      if (opts.failFirstPostAfterStoring && postCalls === 1) {
+        // Message landed at Slack, but the ack never came back.
+        throw Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })
+      }
+    },
+  }
+  return { store, deps, postCalls: () => postCalls, findCalls: () => finds }
+}
+
+const obFixture: DeliveryObligation = {
+  id: 'd-1',
+  channel: 'C_IDEM',
+  thread: 'T1',
+  payload: 'hello',
+  attempts: 0,
+  state: 'pending',
+  createdAt: 1_700_000_000_000,
+}
+
+describe('deliveryIdempotencyKey (ccsc-o7x.2.3)', () => {
+  test('is deterministic and derived from the obligation id', () => {
+    expect(deliveryIdempotencyKey(obFixture)).toBe('ccsc-reply:d-1')
+    expect(deliveryIdempotencyKey(obFixture)).toBe(deliveryIdempotencyKey({ ...obFixture }))
+  })
+
+  test('distinct ids → distinct keys; same id across threads → same key', () => {
+    expect(deliveryIdempotencyKey({ ...obFixture, id: 'd-2' })).toBe('ccsc-reply:d-2')
+    // The id IS the logical-message identity; channel/thread do not perturb it.
+    expect(deliveryIdempotencyKey({ ...obFixture, channel: 'OTHER', thread: 'X' })).toBe(
+      'ccsc-reply:d-1',
+    )
+  })
+
+  test('the metadata event type is the stable CCSC delivery marker', () => {
+    expect(DELIVERY_METADATA_EVENT_TYPE).toBe('ccsc_reply_delivery')
+  })
+})
+
+describe('makeIdempotentSend (ccsc-o7x.2.3)', () => {
+  test('first delivery posts once under the derived key', async () => {
+    const fake = makeFakeSlack()
+    const send = makeIdempotentSend(fake.deps)
+    await send(obFixture)
+
+    expect(fake.postCalls()).toBe(1)
+    expect(fake.store).toEqual([
+      { key: 'ccsc-reply:d-1', channel: 'C_IDEM', thread: 'T1', payload: 'hello' },
+    ])
+    // The dedup lookup ran first, with the derived key.
+    expect(fake.findCalls()[0]).toEqual({ channel: 'C_IDEM', thread: 'T1', key: 'ccsc-reply:d-1' })
+  })
+
+  test('a replay when the key is already delivered is a no-op (no second post)', async () => {
+    const fake = makeFakeSlack()
+    const send = makeIdempotentSend(fake.deps)
+    await send(obFixture) // posts
+    await send(obFixture) // replay → findDelivered hits → no-op
+
+    expect(fake.postCalls()).toBe(1)
+    expect(fake.store).toHaveLength(1)
+  })
+
+  test('at-most-once under simulated ack loss: posted-then-throws, replay dedups', async () => {
+    const fake = makeFakeSlack({ failFirstPostAfterStoring: true })
+    const send = makeIdempotentSend(fake.deps)
+
+    // First attempt lands the message at Slack but the ack is lost → throws.
+    await expect(send(obFixture)).rejects.toThrow(/socket hang up/)
+    expect(fake.store).toHaveLength(1)
+
+    // The poller would retry. The replay finds the prior post and is a no-op —
+    // the visible message count stays at exactly one.
+    await send(obFixture)
+    expect(fake.postCalls()).toBe(1) // never posted twice
+    expect(fake.store).toHaveLength(1)
+  })
+})
+
+describe('idempotent delivery through the poller (ccsc-o7x.2.3 × 2.2)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_POLL', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-idem-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  test('drainOutbox + makeIdempotentSend: ack loss yields exactly one visible delivery', async () => {
+    // Seed a pending obligation for the poller.
+    const seed = makeSupervisor()
+    const h = await seed.activate(key, 'U')
+    await h.recordTerminalDelivery(h.lease!.token, {
+      id: 'd-1',
+      channel: 'C_POLL',
+      thread: 'T1',
+      payload: 'hello',
+    })
+
+    // The first post lands at Slack then throws (ack lost). The poller's in-pass
+    // retry re-sends — but the idempotent wrapper finds the prior post and
+    // no-ops, so the obligation is delivered with exactly one visible message.
+    const fake = makeFakeSlack({ failFirstPostAfterStoring: true })
+    const sup = makeSupervisor()
+    const report = await sup.drainOutbox(makeIdempotentSend(fake.deps), {
+      maxAttempts: 3,
+      delayMs: async () => {},
+    })
+
+    expect(report.delivered).toEqual(['d-1'])
+    expect(report.deadLettered).toEqual([])
+    expect(fake.postCalls()).toBe(1) // posted exactly once despite the retry
+    expect(fake.store).toHaveLength(1)
+
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('delivered')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Slack delivery adapter — createDeliverySendDeps (ccsc-o7x.3)
+// ---------------------------------------------------------------------------
+
+/** A coherent fake Slack: `chat.postMessage` appends the message (with its
+ *  metadata) to a thread store that `conversations.replies` then returns — so a
+ *  post is visible to a later findDelivered, exactly like the real API. */
+function makeFakeSlackClient(seed: Array<{ ts: string; eventType?: string; key?: string }> = []) {
+  const store: Array<{
+    ts: string
+    metadata?: { event_type?: string; event_payload?: Record<string, unknown> }
+  }> = seed.map((s) => ({
+    ts: s.ts,
+    metadata: s.eventType
+      ? { event_type: s.eventType, event_payload: { idempotency_key: s.key } }
+      : undefined,
+  }))
+  const posted: Array<Record<string, unknown>> = []
+  const repliesCalls: Array<Record<string, unknown>> = []
+  const client = {
+    conversations: {
+      replies: async (args: Record<string, unknown>) => {
+        repliesCalls.push(args)
+        return { messages: store }
+      },
+    },
+    chat: {
+      postMessage: async (args: Record<string, unknown>) => {
+        posted.push(args)
+        const ts = `posted-${posted.length}`
+        store.push({
+          ts,
+          metadata: args.metadata as
+            | { event_type?: string; event_payload?: Record<string, unknown> }
+            | undefined,
+        })
+        return { ts }
+      },
+    },
+  }
+  return {
+    client: client as unknown as Parameters<typeof createDeliverySendDeps>[0],
+    posted,
+    repliesCalls,
+  }
+}
+
+describe('createDeliverySendDeps — Slack adapter (ccsc-o7x.3)', () => {
+  const ob: DeliveryObligation = {
+    id: 'd-1',
+    channel: 'C1',
+    thread: 'T1',
+    payload: 'hello',
+    attempts: 0,
+    state: 'pending',
+    createdAt: 1,
+  }
+
+  test('post stamps the idempotency key into Slack message metadata', async () => {
+    const fake = makeFakeSlackClient()
+    await createDeliverySendDeps(fake.client).post(ob, 'ccsc-reply:d-1')
+    expect(fake.posted).toHaveLength(1)
+    expect(fake.posted[0]).toMatchObject({
+      channel: 'C1',
+      text: 'hello',
+      thread_ts: 'T1',
+      metadata: {
+        event_type: 'ccsc_reply_delivery',
+        event_payload: { idempotency_key: 'ccsc-reply:d-1' },
+      },
+    })
+  })
+
+  test('findDelivered returns the ts when a prior post carries the matching key', async () => {
+    const fake = makeFakeSlackClient([
+      { ts: '111.222', eventType: 'ccsc_reply_delivery', key: 'ccsc-reply:d-1' },
+    ])
+    const deps = createDeliverySendDeps(fake.client)
+    expect(await deps.findDelivered('C1', 'T1', 'ccsc-reply:d-1')).toBe('111.222')
+    // Looked up the thread with metadata included.
+    expect(fake.repliesCalls[0]).toMatchObject({
+      channel: 'C1',
+      ts: 'T1',
+      include_all_metadata: true,
+    })
+  })
+
+  test('findDelivered returns null when no message carries the key (wrong key or no metadata)', async () => {
+    const fake = makeFakeSlackClient([
+      { ts: 'x', eventType: 'ccsc_reply_delivery', key: 'ccsc-reply:OTHER' },
+      { ts: 'y' }, // a plain message, no delivery metadata
+    ])
+    expect(
+      await createDeliverySendDeps(fake.client).findDelivered('C1', 'T1', 'ccsc-reply:d-1'),
+    ).toBeNull()
+  })
+
+  test('findDelivered short-circuits to null without an API call when the thread is empty', async () => {
+    const fake = makeFakeSlackClient()
+    expect(
+      await createDeliverySendDeps(fake.client).findDelivered('C1', '', 'ccsc-reply:d-1'),
+    ).toBeNull()
+    expect(fake.repliesCalls).toHaveLength(0)
+  })
+
+  test('createReplyPoster stamps the key into metadata and returns the resulting ts', async () => {
+    const fake = makeFakeSlackClient()
+    const ts = await createReplyPoster(fake.client)(ob, 'ccsc-reply:d-1')
+    expect(ts).toBe('posted-1')
+    expect(fake.posted[0]).toMatchObject({
+      channel: 'C1',
+      text: 'hello',
+      thread_ts: 'T1',
+      metadata: {
+        event_type: 'ccsc_reply_delivery',
+        event_payload: { idempotency_key: 'ccsc-reply:d-1' },
+      },
+    })
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Slack file adapter — createFileSendDeps (ccsc-o7x.5 part 2). read-once
+// readAndGuard (exfil guard on the bytes that will be sent), (filename,size)
+// dedup scan, filesUploadV2 upload. The production FileUploadDeps consumed by the
+// inline path AND the poller.
+// ---------------------------------------------------------------------------
+
+describe('createFileSendDeps — Slack file adapter (ccsc-o7x.5)', () => {
+  const fileOb = {
+    id: 'r-1:file:0',
+    channel: 'C1',
+    thread: 'T1',
+    payload: '',
+    attempts: 0,
+    state: 'pending' as const,
+    createdAt: 1,
+    upload: { path: '/inbox/a.png', filename: 'a.png' },
+  }
+
+  function makeDeps(
+    opts: {
+      threadFiles?: Array<{ id?: string; name?: string; size?: number }>
+      threadTs?: string
+      uploadResult?: unknown
+      sendableErr?: Error
+      contentErr?: Error
+      filenameErr?: Error
+      readBytes?: Uint8Array
+      size?: number
+      sizeThrows?: boolean
+    } = {},
+  ) {
+    const journaled: string[] = []
+    const uploadCalls: Array<Record<string, unknown>> = []
+    const repliesCalls: Array<Record<string, unknown>> = []
+    const client = {
+      conversations: {
+        replies: async (args: Record<string, unknown>) => {
+          repliesCalls.push(args)
+          // ts default is well after fileOb.createdAt (1) so the (filename,size)
+          // scan's delivery-window filter passes unless a test overrides it.
+          return {
+            messages: [{ ts: opts.threadTs ?? '1700000000.000200', files: opts.threadFiles ?? [] }],
+          }
+        },
+      },
+      filesUploadV2: async (args: Record<string, unknown>) => {
+        uploadCalls.push(args)
+        return opts.uploadResult ?? { files: [{ id: 'F-new' }] }
+      },
+    }
+    const deps = createFileSendDeps({
+      client: client as unknown as Parameters<typeof createFileSendDeps>[0]['client'],
+      assertSendable: () => {
+        if (opts.sendableErr) throw opts.sendableErr
+      },
+      // The guard is called on the latin1 content first, then the filename — tell
+      // them apart by the argument so a test can target either.
+      assertNoSecretValues: (t) => {
+        if (t === fileOb.upload.filename) {
+          if (opts.filenameErr) throw opts.filenameErr
+        } else if (opts.contentErr) {
+          throw opts.contentErr
+        }
+      },
+      journalExfilBlock: (reason) => journaled.push(reason),
+      readFile: () => opts.readBytes ?? new Uint8Array([1, 2, 3]),
+      fileSize: () => {
+        if (opts.sizeThrows) throw new Error('ENOENT')
+        return opts.size ?? 3
+      },
+    })
+    return { deps, journaled, uploadCalls, repliesCalls }
+  }
+
+  test('readAndGuard reads once, runs guards, returns the bytes', async () => {
+    const { deps } = makeDeps({ readBytes: new Uint8Array([9, 9]) })
+    expect(
+      Array.from(await deps.readAndGuard({ path: '/inbox/a.png', filename: 'a.png' })),
+    ).toEqual([9, 9])
+  })
+
+  test('readAndGuard: assertSendable block → journals exfil.block + throws ExfilBlockedError', async () => {
+    const { deps, journaled } = makeDeps({ sendableErr: new Error('state-dir denied') })
+    await expect(
+      deps.readAndGuard({ path: '/state/access.json', filename: 'access.json' }),
+    ).rejects.toBeInstanceOf(ExfilBlockedError)
+    expect(journaled).toEqual(['state-dir denied'])
+  })
+
+  test('readAndGuard: secret in content → ExfilBlockedError + journaled', async () => {
+    const { deps, journaled } = makeDeps({ contentErr: new Error('secret value in payload') })
+    await expect(
+      deps.readAndGuard({ path: '/inbox/a.png', filename: 'a.png' }),
+    ).rejects.toBeInstanceOf(ExfilBlockedError)
+    expect(journaled).toEqual(['secret value in payload'])
+  })
+
+  test('readAndGuard: secret in filename → ExfilBlockedError + journaled', async () => {
+    const { deps, journaled } = makeDeps({ filenameErr: new Error('secret in filename') })
+    await expect(
+      deps.readAndGuard({ path: '/inbox/a.png', filename: 'a.png' }),
+    ).rejects.toBeInstanceOf(ExfilBlockedError)
+    expect(journaled).toEqual(['secret in filename'])
+  })
+
+  test('findUploaded: recorded uploadedFileId match is exact and NOT time-scoped', async () => {
+    // Even a file shared BEFORE the obligation's createdAt matches by recorded id
+    // (the id is definitive proof this obligation already uploaded).
+    const { deps } = makeDeps({
+      threadFiles: [{ id: 'F-prev', name: 'x', size: 1 }],
+      threadTs: '1700000000.400',
+    })
+    expect(
+      await deps.findUploaded({
+        ...fileOb,
+        uploadedFileId: 'F-prev',
+        createdAt: 1_700_000_000_500,
+      }),
+    ).toBe('F-prev')
+  })
+
+  test('findUploaded: (filename, size) scan match within the delivery window → returns the file id', async () => {
+    const { deps } = makeDeps({
+      threadFiles: [{ id: 'F-match', name: 'a.png', size: 3 }],
+      size: 3,
+    })
+    expect(await deps.findUploaded(fileOb)).toBe('F-match')
+  })
+
+  test('findUploaded: a STALE older file (same name+size, shared before createdAt) is NOT matched — no false dedup/drop', async () => {
+    // The thread holds an older file with the SAME name + size from a previous
+    // turn; without the delivery-window filter this would falsely dedup and DROP
+    // the new upload (the loss bug). The message ts is before the obligation's
+    // createdAt, so it must not match.
+    const { deps } = makeDeps({
+      threadFiles: [{ id: 'F-stale', name: 'a.png', size: 3 }],
+      threadTs: '1700000000.400',
+      size: 3,
+    })
+    expect(await deps.findUploaded({ ...fileOb, createdAt: 1_700_000_000_500 })).toBeNull()
+  })
+
+  test('findUploaded: no match → null', async () => {
+    const { deps } = makeDeps({
+      threadFiles: [{ id: 'F-other', name: 'b.png', size: 99 }],
+      size: 3,
+    })
+    expect(await deps.findUploaded(fileOb)).toBeNull()
+  })
+
+  test('findUploaded: no thread → null without an API call', async () => {
+    const { deps, repliesCalls } = makeDeps({})
+    expect(await deps.findUploaded({ ...fileOb, thread: '' })).toBeNull()
+    expect(repliesCalls).toHaveLength(0)
+  })
+
+  test('findUploaded: a fileSize error degrades to no (filename,size) match', async () => {
+    const { deps } = makeDeps({
+      threadFiles: [{ id: 'F', name: 'a.png', size: 3 }],
+      sizeThrows: true,
+    })
+    expect(await deps.findUploaded(fileOb)).toBeNull()
+  })
+
+  test('upload sends the guarded bytes via filesUploadV2 and returns the new file id', async () => {
+    const { deps, uploadCalls } = makeDeps({})
+    const id = await deps.upload(
+      { ...fileOb, upload: { path: '/inbox/a.png', filename: 'a.png', comment: 'see attached' } },
+      new Uint8Array([7, 7]),
+    )
+    expect(id).toBe('F-new')
+    expect(uploadCalls[0]).toMatchObject({
+      channel_id: 'C1',
+      filename: 'a.png',
+      thread_ts: 'T1',
+      initial_comment: 'see attached',
+    })
+  })
+
+  test('upload extracts a nested file id shape, and tolerates none (empty string)', async () => {
+    const nested = makeDeps({ uploadResult: { files: [{ files: [{ id: 'F-nested' }] }] } })
+    expect(await nested.deps.upload(fileOb, new Uint8Array([1]))).toBe('F-nested')
+    const none = makeDeps({ uploadResult: { files: [{}] } })
+    expect(await none.deps.upload(fileOb, new Uint8Array([1]))).toBe('')
+  })
+
+  test('upload throws when the obligation has no upload descriptor', async () => {
+    const { deps } = makeDeps({})
+    await expect(
+      deps.upload({ ...fileOb, upload: undefined }, new Uint8Array([1])),
+    ).rejects.toThrow(/no upload descriptor/)
+  })
+})
+
+describe('outbox poller × Slack adapter end-to-end (ccsc-o7x.3)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_E2E', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-e2e-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  test('drainOutbox via the real adapter posts once and marks the obligation delivered', async () => {
+    const seed = makeSupervisor()
+    const h = await seed.activate(key, 'U')
+    await h.recordTerminalDelivery(h.lease!.token, {
+      id: 'd-1',
+      channel: key.channel,
+      thread: key.thread,
+      payload: 'hello',
+    })
+
+    const fake = makeFakeSlackClient()
+    const sup = makeSupervisor()
+    const report = await sup.drainOutbox(makeIdempotentSend(createDeliverySendDeps(fake.client)))
+
+    expect(report.delivered).toEqual(['d-1'])
+    expect(fake.posted).toHaveLength(1)
+    expect(fake.posted[0]).toMatchObject({
+      text: 'hello',
+      metadata: {
+        event_type: 'ccsc_reply_delivery',
+        event_payload: { idempotency_key: 'ccsc-reply:d-1' },
+      },
+    })
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('delivered')
+  })
+
+  test('drainOutbox dead-letters an ExfilBlockedError on the FIRST failure (no retry to maxAttempts)', async () => {
+    // ccsc-o7x.5 — a file (re)upload that fails the exfil guard is permanent: the
+    // poller must dead-letter immediately, not burn maxAttempts retrying bytes
+    // that will never pass.
+    const seed = makeSupervisor()
+    const h = await seed.activate(key, 'U')
+    await h.recordTerminalDelivery(h.lease!.token, {
+      id: 'x-1',
+      channel: key.channel,
+      thread: key.thread,
+      payload: 'x',
+    })
+
+    const sup = makeSupervisor()
+    let attempts = 0
+    const report = await sup.drainOutbox(async () => {
+      attempts++
+      throw new ExfilBlockedError('secret value in payload')
+    })
+
+    expect(report.deadLettered).toEqual([{ id: 'x-1', error: 'secret value in payload' }])
+    expect(attempts).toBe(1) // dead-lettered on the first failure, NOT retried
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]).toMatchObject({
+      state: 'dead',
+      attempts: 1,
+      lastError: 'secret value in payload',
+    })
+  })
+
+  test('ack-loss recovery: a pending obligation whose post already landed is deduped, not re-posted', async () => {
+    const seed = makeSupervisor()
+    const h = await seed.activate(key, 'U')
+    await h.recordTerminalDelivery(h.lease!.token, {
+      id: 'd-1',
+      channel: key.channel,
+      thread: key.thread,
+      payload: 'hello',
+    })
+    // Simulate the ack-loss window: the message DID land in the thread under its
+    // key, but the obligation is still pending (the marking write was lost).
+    const fake = makeFakeSlackClient([
+      { ts: '999.000', eventType: 'ccsc_reply_delivery', key: 'ccsc-reply:d-1' },
+    ])
+    const sup = makeSupervisor()
+    const report = await sup.drainOutbox(makeIdempotentSend(createDeliverySendDeps(fake.client)))
+
+    // Delivered (resolved) but NOT re-posted — exactly-once visible delivery.
+    expect(report.delivered).toEqual(['d-1'])
+    expect(fake.posted).toHaveLength(0)
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]?.state).toBe('delivered')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Durable single-message reply delivery — deliverReplyDurably (ccsc-o7x.3 pt2)
+// ---------------------------------------------------------------------------
+
+describe('deliverReplyDurably (ccsc-o7x.3 pt2)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_DUR', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-durable-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  /** Pre-create the session file so deliverReplyDurably's owner-less activate
+   *  resolves it from disk (mirrors a session the inbound message created). */
+  async function seedSession() {
+    const seed = makeSupervisor()
+    await seed.activate(key, 'U')
+  }
+
+  function slackError(code: string): Error {
+    return Object.assign(new Error(`slack: ${code}`), { data: { ok: false, error: code } })
+  }
+
+  function makePoster(behavior: 'ok' | Error, ts = 'ts-1') {
+    const calls: Array<{ id: string; key: string; text: string }> = []
+    const poster: ReplyPoster = async (obligation, idemKey) => {
+      calls.push({ id: obligation.id, key: idemKey, text: obligation.payload })
+      if (behavior !== 'ok') throw behavior
+      return ts
+    }
+    return { poster, calls }
+  }
+
+  const reply = { id: 'r-1', channel: 'C_DUR', thread: 'T1', text: 'hello' }
+
+  test('success: posts under the obligation key, marks delivered, returns the ts', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster, calls } = makePoster('ok', 'ts-9')
+
+    const result = await deliverReplyDurably({ supervisor: sup, post: poster }, reply)
+
+    expect(result).toEqual({ status: 'delivered', ts: 'ts-9' })
+    // Posted exactly once, under the deterministic idempotency key.
+    expect(calls).toEqual([{ id: 'r-1', key: 'ccsc-reply:r-1', text: 'hello' }])
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]).toMatchObject({ id: 'r-1', state: 'delivered', attempts: 1 })
+    // Nothing left pending.
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('records the obligation BEFORE the send (crash-before-send safe)', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    // A poster that asserts the obligation is already persisted as pending at
+    // the moment of the send — proving record happened first.
+    let pendingAtSendTime = -1
+    const poster: ReplyPoster = async () => {
+      const probe = makeSupervisor()
+      pendingAtSendTime = (await probe.pendingDeliveries()).length
+      return 'ts-1'
+    }
+    await deliverReplyDurably({ supervisor: sup, post: poster }, reply)
+    expect(pendingAtSendTime).toBe(1) // obligation was durable before the post returned
+  })
+
+  test('transient error: leaves the obligation pending, returns queued (poller will retry)', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster } = makePoster(slackError('rate_limited'))
+
+    const result = await deliverReplyDurably({ supervisor: sup, post: poster }, reply)
+
+    expect(result).toEqual({ status: 'queued' })
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]).toMatchObject({ id: 'r-1', state: 'pending', attempts: 1 })
+    // Still pending → the poller picks it up (attempts>0 → findDelivered dedups).
+    expect((await sup.pendingDeliveries()).map((o) => o.id)).toEqual(['r-1'])
+  })
+
+  test('non-retryable error: marks dead with the error recorded, then rethrows', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster } = makePoster(slackError('channel_not_found'))
+
+    await expect(deliverReplyDurably({ supervisor: sup, post: poster }, reply)).rejects.toThrow(
+      /channel_not_found/,
+    )
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]).toMatchObject({
+      id: 'r-1',
+      state: 'dead',
+      attempts: 1,
+      lastError: 'channel_not_found',
+    })
+    // Dead, not pending → the poller leaves it alone.
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('throws DurableUnavailableError (records nothing) when the session cannot be activated', async () => {
+    // No seedSession() — the session file does not exist, and durable delivery
+    // activates without an owner, so activate rejects.
+    const sup = makeSupervisor()
+    const { poster, calls } = makePoster('ok')
+
+    await expect(
+      deliverReplyDurably({ supervisor: sup, post: poster }, reply),
+    ).rejects.toBeInstanceOf(DurableUnavailableError)
+    expect(calls).toHaveLength(0) // never attempted a send
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Durable chunked (multi-message) reply delivery — deliverChunkedReplyDurably
+// (ccsc-o7x.4). One reply → N chunks → N obligations, each with id <id>:<i> and
+// its own idempotency key, recorded all-or-nothing before any send, posted in
+// order, stopping at the first transient gap so the poller redelivers the tail
+// in order.
+// ---------------------------------------------------------------------------
+
+describe('deliverChunkedReplyDurably (ccsc-o7x.4)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_CHUNK', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-chunked-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  async function seedSession() {
+    const seed = makeSupervisor()
+    await seed.activate(key, 'U')
+  }
+
+  function slackError(code: string): Error {
+    return Object.assign(new Error(`slack: ${code}`), { data: { ok: false, error: code } })
+  }
+
+  /** Poster that records every call and optionally throws on a given chunk index
+   *  (0-based, in post order). Returns `ts-<idx>` for successful posts. */
+  function makePoster(opts: { failOn?: number; error?: Error } = {}) {
+    const calls: Array<{ id: string; key: string; text: string }> = []
+    const poster: ReplyPoster = async (obligation, idemKey) => {
+      const idx = calls.length
+      calls.push({ id: obligation.id, key: idemKey, text: obligation.payload })
+      if (opts.failOn === idx && opts.error) throw opts.error
+      return `ts-${idx}`
+    }
+    return { poster, calls }
+  }
+
+  const baseReply = { id: 'r-1', channel: 'C_CHUNK', thread: 'T1' }
+
+  test('success: posts every chunk in order, each under its own key, all delivered', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster, calls } = makePoster()
+
+    const result = await deliverChunkedReplyDurably(
+      { supervisor: sup, post: poster },
+      { ...baseReply, chunks: ['a', 'b', 'c'] },
+    )
+
+    expect(result).toEqual({ status: 'delivered', ts: 'ts-0', sent: 3 })
+    // Posted in order, each chunk under its own ccsc-reply:r-1:<i> key.
+    expect(calls).toEqual([
+      { id: 'r-1:0', key: 'ccsc-reply:r-1:0', text: 'a' },
+      { id: 'r-1:1', key: 'ccsc-reply:r-1:1', text: 'b' },
+      { id: 'r-1:2', key: 'ccsc-reply:r-1:2', text: 'c' },
+    ])
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.map((o) => [o.id, o.state])).toEqual([
+      ['r-1:0', 'delivered'],
+      ['r-1:1', 'delivered'],
+      ['r-1:2', 'delivered'],
+    ])
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('records ALL chunks BEFORE the first send (crash-before-send safe, all-or-nothing)', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    let pendingAtFirstSend = -1
+    const poster: ReplyPoster = async () => {
+      if (pendingAtFirstSend < 0) {
+        const probe = makeSupervisor()
+        pendingAtFirstSend = (await probe.pendingDeliveries()).length
+      }
+      return 'ts'
+    }
+    await deliverChunkedReplyDurably(
+      { supervisor: sup, post: poster },
+      { ...baseReply, chunks: ['a', 'b', 'c'] },
+    )
+    // All 3 obligations were durable on disk before the first post returned.
+    expect(pendingAtFirstSend).toBe(3)
+  })
+
+  test('transient error mid-stream: stops, leaves the failing chunk + tail pending, returns queued', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster, calls } = makePoster({ failOn: 1, error: slackError('rate_limited') })
+
+    const result = await deliverChunkedReplyDurably(
+      { supervisor: sup, post: poster },
+      { ...baseReply, chunks: ['a', 'b', 'c'] },
+    )
+
+    expect(result).toEqual({ status: 'queued', delivered: 1, pending: 2 })
+    // Chunk 'c' (index 2) was NOT posted inline — order is preserved by stopping.
+    expect(calls.map((c) => c.text)).toEqual(['a', 'b'])
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.map((o) => [o.id, o.state])).toEqual([
+      ['r-1:0', 'delivered'],
+      ['r-1:1', 'pending'],
+      ['r-1:2', 'pending'],
+    ])
+    // The poller redelivers chunks 1 and 2, in order.
+    expect((await sup.pendingDeliveries()).map((o) => o.id)).toEqual(['r-1:1', 'r-1:2'])
+  })
+
+  test('non-retryable error mid-stream: marks the chunk dead and rethrows (prefix already landed)', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster, calls } = makePoster({ failOn: 1, error: slackError('channel_not_found') })
+
+    await expect(
+      deliverChunkedReplyDurably(
+        { supervisor: sup, post: poster },
+        { ...baseReply, chunks: ['a', 'b', 'c'] },
+      ),
+    ).rejects.toThrow(/channel_not_found/)
+
+    expect(calls.map((c) => c.text)).toEqual(['a', 'b']) // stopped at the failing chunk
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.map((o) => [o.id, o.state])).toEqual([
+      ['r-1:0', 'delivered'],
+      ['r-1:1', 'dead'],
+      ['r-1:2', 'pending'],
+    ])
+    expect(reloaded.outbox?.[1]?.lastError).toBe('channel_not_found')
+  })
+
+  test('throws DurableUnavailableError (records nothing) when the session cannot be activated', async () => {
+    // No seedSession → the owner-less activate rejects before any record/send.
+    const sup = makeSupervisor()
+    const { poster, calls } = makePoster()
+
+    await expect(
+      deliverChunkedReplyDurably(
+        { supervisor: sup, post: poster },
+        { ...baseReply, chunks: ['a', 'b'] },
+      ),
+    ).rejects.toBeInstanceOf(DurableUnavailableError)
+    expect(calls).toHaveLength(0)
+    // Nothing was recorded.
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('degenerate single-chunk reply still delivers (N=1)', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster, calls } = makePoster()
+
+    const result = await deliverChunkedReplyDurably(
+      { supervisor: sup, post: poster },
+      { ...baseReply, chunks: ['only'] },
+    )
+
+    expect(result).toEqual({ status: 'delivered', ts: 'ts-0', sent: 1 })
+    expect(calls).toEqual([{ id: 'r-1:0', key: 'ccsc-reply:r-1:0', text: 'only' }])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Durable streaming reply finalize — beginDurableStream (ccsc-o7x.6). A stream
+// records ONE full-text obligation up front; completing marks it delivered, an
+// in-process failure marks it dead, and a process crash (neither mark called)
+// leaves it pending so the poller redelivers the final message. (ADR-002
+// addendum.)
+// ---------------------------------------------------------------------------
+
+describe('beginDurableStream (ccsc-o7x.6)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_STREAM', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-stream-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+
+  /** Pre-create the session file so the owner-less activate resolves it from
+   *  disk (mirrors a session the inbound message created). */
+  async function seedSession() {
+    const seed = makeSupervisor()
+    await seed.activate(key, 'U')
+  }
+
+  const reply = { id: 's-1', channel: 'C_STREAM', thread: 'T1', text: 'the full streamed reply' }
+
+  test('records ONE pending obligation carrying the FULL text before returning', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+
+    await beginDurableStream({ supervisor: sup }, reply)
+
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox).toHaveLength(1)
+    // Full text as the payload — a stream-finalize obligation, NOT a chunk.
+    expect(reloaded.outbox?.[0]).toMatchObject({
+      id: 's-1',
+      state: 'pending',
+      payload: 'the full streamed reply',
+    })
+    // Pending → a crash here means the poller redelivers the final message.
+    expect((await sup.pendingDeliveries()).map((o) => o.id)).toEqual(['s-1'])
+  })
+
+  test('markDelivered: stream completed → obligation delivered, nothing pending', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const handle = await beginDurableStream({ supervisor: sup }, reply)
+
+    await handle.markDelivered()
+
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]).toMatchObject({ id: 's-1', state: 'delivered', attempts: 1 })
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('markDead: in-process stream failure → obligation dead with the reason, nothing pending', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const handle = await beginDurableStream({ supervisor: sup }, reply)
+
+    await handle.markDead('failed mid-stream: channel removed')
+
+    const reloaded = await loadSession(tmpRoot, sessionPath(tmpRoot, key))
+    expect(reloaded.outbox?.[0]).toMatchObject({
+      id: 's-1',
+      state: 'dead',
+      attempts: 1,
+      lastError: 'failed mid-stream: channel removed',
+    })
+    // Dead, not pending → the poller never auto-redelivers a gate-rejected stream.
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('crash mid-stream (neither mark called) leaves the obligation pending across a restart', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    // Begin, then "crash": never call markDelivered/markDead.
+    await beginDurableStream({ supervisor: sup }, reply)
+
+    // A fresh supervisor (simulating a restart) still sees the pending obligation
+    // — the boot-drain / poller redelivers the full text.
+    const afterRestart = makeSupervisor()
+    expect((await afterRestart.pendingDeliveries()).map((o) => o.id)).toEqual(['s-1'])
+  })
+
+  test('throws DurableUnavailableError (records nothing) when the session cannot be activated', async () => {
+    // No seedSession() — the session file does not exist and the owner-less
+    // activate rejects, so nothing is recorded.
+    const sup = makeSupervisor()
+
+    await expect(beginDurableStream({ supervisor: sup }, reply)).rejects.toBeInstanceOf(
+      DurableUnavailableError,
+    )
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Durable file-upload reply delivery — sendFileObligation + deliverFileReplyDurably
+// (ccsc-o7x.5). dedup → guard → upload, with the exfil guard re-run on EVERY
+// upload; the files-bearing sibling of deliverChunkedReplyDurably.
+// ---------------------------------------------------------------------------
+
+describe('sendFileObligation (ccsc-o7x.5)', () => {
+  function makeFileDeps(opts: { found?: string | null; uploadId?: string; guardErr?: Error }) {
+    const calls: string[] = []
+    const deps: FileUploadDeps = {
+      readAndGuard: async (u) => {
+        calls.push(`readAndGuard:${u.filename}`)
+        if (opts.guardErr) throw opts.guardErr
+        return new Uint8Array([1, 2, 3])
+      },
+      findUploaded: async () => {
+        calls.push('findUploaded')
+        return opts.found ?? null
+      },
+      upload: async () => {
+        calls.push('upload')
+        return opts.uploadId ?? 'F123'
+      },
+    }
+    return { deps, calls }
+  }
+
+  const fileOb = {
+    id: 'r-1:file:0',
+    channel: 'C',
+    thread: 'T',
+    payload: '',
+    attempts: 0,
+    state: 'pending' as const,
+    createdAt: 0,
+    upload: { path: '/inbox/a.png', filename: 'a.png' },
+  }
+
+  test('dedup hit: returns the existing file id WITHOUT guarding or uploading', async () => {
+    const { deps, calls } = makeFileDeps({ found: 'F-existing' })
+    const id = await sendFileObligation(deps, fileOb)
+    expect(id).toBe('F-existing')
+    expect(calls).toEqual(['findUploaded']) // no guard, no upload on a dedup hit
+  })
+
+  test('dedup miss: guards BEFORE uploading, returns the new file id', async () => {
+    const { deps, calls } = makeFileDeps({ found: null, uploadId: 'F-new' })
+    const id = await sendFileObligation(deps, fileOb)
+    expect(id).toBe('F-new')
+    // Order proves read+guard ran before the upload (re-validate, then send the
+    // same bytes).
+    expect(calls).toEqual(['findUploaded', 'readAndGuard:a.png', 'upload'])
+  })
+
+  test('guard block: throws ExfilBlockedError and NEVER uploads', async () => {
+    const { deps, calls } = makeFileDeps({
+      found: null,
+      guardErr: new ExfilBlockedError('secret in file'),
+    })
+    await expect(sendFileObligation(deps, fileOb)).rejects.toBeInstanceOf(ExfilBlockedError)
+    expect(calls).toEqual(['findUploaded', 'readAndGuard:a.png']) // upload never reached
+  })
+
+  test('throws when the obligation has no upload descriptor', async () => {
+    const { deps } = makeFileDeps({})
+    await expect(sendFileObligation(deps, { ...fileOb, upload: undefined })).rejects.toThrow(
+      /no upload descriptor/,
+    )
+  })
+})
+
+describe('deliverFileReplyDurably (ccsc-o7x.5)', () => {
+  let rawRoot: string
+  let tmpRoot: string
+  let nowValue: number
+  const key = { channel: 'C_FILE', thread: 'T1' }
+
+  beforeEach(() => {
+    rawRoot = mkdtempSync(join(tmpdir(), 'supervisor-file-'))
+    tmpRoot = realpathSync.native(rawRoot)
+    nowValue = 1_700_000_000_000
+  })
+  afterEach(() => {
+    rmSync(rawRoot, { recursive: true, force: true })
+  })
+
+  function makeSupervisor() {
+    return createSessionSupervisor({
+      stateRoot: tmpRoot,
+      log: () => {},
+      clock: () => nowValue,
+      leaseTtlMs: 1000,
+      ownerId: 'OWNER-1',
+    })
+  }
+  async function seedSession() {
+    const seed = makeSupervisor()
+    await seed.activate(key, 'U')
+  }
+  function slackError(code: string): Error {
+    return Object.assign(new Error(`slack: ${code}`), { data: { ok: false, error: code } })
+  }
+  function makePoster(behavior: 'ok' | Error, ts = 'ts-0') {
+    const calls: string[] = []
+    const poster: ReplyPoster = async (ob) => {
+      calls.push(ob.id)
+      if (behavior !== 'ok') throw behavior
+      return ts
+    }
+    return { poster, calls }
+  }
+  function makeFileDeps(opts: { found?: string | null; uploadErr?: Error; guardErr?: Error } = {}) {
+    const uploads: string[] = []
+    let n = 0
+    const deps: FileUploadDeps = {
+      readAndGuard: async () => {
+        if (opts.guardErr) throw opts.guardErr
+        return new Uint8Array([1, 2, 3])
+      },
+      findUploaded: async () => opts.found ?? null,
+      upload: async (ob) => {
+        if (opts.uploadErr) throw opts.uploadErr
+        uploads.push(ob.id)
+        return `F-${n++}`
+      },
+    }
+    return { deps, uploads }
+  }
+
+  const base = {
+    id: 'r-1',
+    channel: 'C_FILE',
+    thread: 'T1',
+    chunks: ['the message'],
+    files: [{ path: '/inbox/a.png', filename: 'a.png' }],
+  }
+
+  test('text + file all deliver: each marked delivered, file carries uploadedFileId, nothing pending', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster } = makePoster('ok', 'ts-9')
+    const { deps, uploads } = makeFileDeps()
+
+    const result = await deliverFileReplyDurably(
+      { supervisor: sup, post: poster, files: deps },
+      base,
+    )
+
+    expect(result).toEqual({ status: 'delivered', ts: 'ts-9', messagesSent: 1, filesSent: 1 })
+    expect(uploads).toEqual(['r-1:file:0'])
+    const obs = (await loadSession(tmpRoot, sessionPath(tmpRoot, key))).outbox ?? []
+    expect(obs.find((o) => o.id === 'r-1:0')).toMatchObject({ state: 'delivered' })
+    expect(obs.find((o) => o.id === 'r-1:file:0')).toMatchObject({
+      state: 'delivered',
+      uploadedFileId: 'F-0',
+    })
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('records ALL obligations (text + file) before any send', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    let pendingAtFirstSend = -1
+    const poster: ReplyPoster = async () => {
+      pendingAtFirstSend = (await makeSupervisor().pendingDeliveries()).length
+      return 'ts-0'
+    }
+    const { deps } = makeFileDeps()
+    await deliverFileReplyDurably({ supervisor: sup, post: poster, files: deps }, base)
+    expect(pendingAtFirstSend).toBe(2) // text + file both durable before the first post
+  })
+
+  test('dedup: an already-uploaded file is not re-uploaded, still marked delivered', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster } = makePoster('ok')
+    const { deps, uploads } = makeFileDeps({ found: 'F-existing' })
+
+    const result = await deliverFileReplyDurably(
+      { supervisor: sup, post: poster, files: deps },
+      base,
+    )
+
+    expect(result.status).toBe('delivered')
+    expect(uploads).toHaveLength(0) // dedup hit → no upload
+    const obs = (await loadSession(tmpRoot, sessionPath(tmpRoot, key))).outbox ?? []
+    expect(obs.find((o) => o.id === 'r-1:file:0')).toMatchObject({
+      state: 'delivered',
+      uploadedFileId: 'F-existing',
+    })
+  })
+
+  test('exfil block on the file: marks it dead and rethrows (text already landed)', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster } = makePoster('ok')
+    const { deps } = makeFileDeps({ guardErr: new ExfilBlockedError('secret in a.png') })
+
+    await expect(
+      deliverFileReplyDurably({ supervisor: sup, post: poster, files: deps }, base),
+    ).rejects.toBeInstanceOf(ExfilBlockedError)
+
+    const obs = (await loadSession(tmpRoot, sessionPath(tmpRoot, key))).outbox ?? []
+    expect(obs.find((o) => o.id === 'r-1:0')).toMatchObject({ state: 'delivered' })
+    // The blocked file is dead, never pending → the poller never redelivers it.
+    expect(obs.find((o) => o.id === 'r-1:file:0')).toMatchObject({ state: 'dead' })
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+
+  test('non-retryable Slack error on the file: marks dead with the code, rethrows', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster } = makePoster('ok')
+    const { deps } = makeFileDeps({ uploadErr: slackError('channel_not_found') })
+
+    await expect(
+      deliverFileReplyDurably({ supervisor: sup, post: poster, files: deps }, base),
+    ).rejects.toThrow(/channel_not_found/)
+    const obs = (await loadSession(tmpRoot, sessionPath(tmpRoot, key))).outbox ?? []
+    expect(obs.find((o) => o.id === 'r-1:file:0')).toMatchObject({
+      state: 'dead',
+      lastError: 'channel_not_found',
+    })
+  })
+
+  test('transient file upload error: marks pending + stops, returns queued (poller redelivers)', async () => {
+    await seedSession()
+    const sup = makeSupervisor()
+    const { poster } = makePoster('ok')
+    const { deps } = makeFileDeps({ uploadErr: slackError('rate_limited') })
+
+    const result = await deliverFileReplyDurably(
+      { supervisor: sup, post: poster, files: deps },
+      base,
+    )
+
+    expect(result).toEqual({ status: 'queued', delivered: 1, pending: 1 }) // text delivered, file pending
+    expect((await sup.pendingDeliveries()).map((o) => o.id)).toEqual(['r-1:file:0'])
+  })
+
+  test('throws DurableUnavailableError (records nothing) when the session cannot be activated', async () => {
+    const sup = makeSupervisor()
+    const { poster } = makePoster('ok')
+    const { deps } = makeFileDeps()
+    await expect(
+      deliverFileReplyDurably({ supervisor: sup, post: poster, files: deps }, base),
+    ).rejects.toBeInstanceOf(DurableUnavailableError)
+    expect(await sup.pendingDeliveries()).toHaveLength(0)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // SessionSupervisor.quiesce — 000-docs/session-state-machine.md §119-124, §266
 // ---------------------------------------------------------------------------
 
@@ -5543,10 +8826,13 @@ describe('JournalEvent', () => {
     // 31-A.5) + manifest.publish (Epic 31-B.1/.3) + system.key_rotation
     // (ccsc-22l) + policy.deny.context_stripped (ccsc-06s) +
     // 5 admin.* kinds (ccsc-3w0) + system.stream_finalize (ccsc-ele) +
-    // 4 admin.mute/unmute kinds (ccsc-gjm: admin.mute, admin.mute.denied,
-    // admin.unmute, admin.unmute.denied). If this number drifts, update
-    // the doc count in journal.ts's header comment too.
-    expect(kinds).toHaveLength(34)
+    // 4 admin.mute/unmute kinds (ccsc-gjm) + 2 session.recovery.* kinds
+    // (ccsc-o7x.1.2: session.recovery.requeued, session.recovery.orphaned) +
+    // session.activate_rejected (ccsc-4e9bf backpressure).
+    // If this number drifts, update the doc count in journal.ts's header
+    // comment too.
+    expect(kinds).toHaveLength(37)
+    expect(kinds).toContain('session.activate_rejected')
     expect(kinds).toContain('manifest.read')
     expect(kinds).toContain('manifest.read.cached')
     expect(kinds).toContain('manifest.publish')
@@ -5562,6 +8848,8 @@ describe('JournalEvent', () => {
     expect(kinds).toContain('admin.mute.denied')
     expect(kinds).toContain('admin.unmute')
     expect(kinds).toContain('admin.unmute.denied')
+    expect(kinds).toContain('session.recovery.requeued')
+    expect(kinds).toContain('session.recovery.orphaned')
     for (const k of kinds) {
       expect(() => JournalEvent.parse(minimal({ kind: k }))).not.toThrow()
     }
@@ -7137,6 +10425,399 @@ describe('decidePermissionRoute', () => {
       }).type,
     ])
     expect(routes).toEqual(new Set(['auto_allow', 'default_human', 'deny', 'require_human']))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Every policy decision is journaled — no silent gaps (ccsc-1iw.2)
+//
+// Regression test for the peer-runtime footgun in 000-docs/ADR-002: the peer
+// runtime kept no durable tool-call record (best-effort stdout key-name +
+// byte-size logs only, no audit table). CCSC writes a signed journal event for
+// every gated policy decision. This pins the decision→journal-kind mapping with
+// a `never` exhaustiveness guard: a NEW permission-route branch added without
+// declaring its journal kind fails to TYPECHECK here, turning a silent audit
+// gap into a deliberate, reviewed choice. Complements (does not duplicate) the
+// decidePermissionRoute routing tests above, the ccsc-06s
+// recordPolicyDenyToJournal two-event tests below, and the audit_chain_verifier
+// acceptance primitive.
+//
+// CONSTRAINT RESOLVED (ccsc-175, PR for bz-ccsc-175): server.ts now builds the
+// policy.allow / .require / .approved events via the importable, side-effect-free
+// builders in policy-dispatch.ts, and dispatches the route→events mapping through
+// the exhaustive `permissionRouteJournalEvents` (a `never`-guard that fails to
+// COMPILE on a new un-journaled route). This block now anchors to that PRODUCTION
+// contract — `permissionRouteJournalKinds` — instead of a test-local switch, so
+// the no-gaps guarantee binds the code server.ts actually runs. The dedicated
+// ccsc-175 block below drives each builder + the deny-path consistency.
+// ---------------------------------------------------------------------------
+describe('every policy decision is journaled — no silent gaps (ccsc-1iw.2)', () => {
+  type RouteType = import('./lib.ts').PermissionRoute['type']
+  type PolicyDecisionShape = import('./lib.ts').PolicyDecisionShape
+
+  test('each decision branch routes to a real EventKind (or the one deliberately-silent route)', async () => {
+    const { decidePermissionRoute } = await import('./lib.ts')
+    const { EventKind } = await import('./journal.ts')
+    // PRODUCTION contract (ccsc-175): the same function server.ts calls to
+    // decide what to journal for a route. No test-local re-implementation.
+    const { permissionRouteJournalKinds } = await import('./policy-dispatch.ts')
+
+    const decisions: PolicyDecisionShape[] = [
+      { kind: 'allow', rule: 'safe-reads' }, // → auto_allow → policy.allow
+      { kind: 'allow' }, // → default_human → (deliberately none)
+      { kind: 'deny', rule: 'no-shell', reason: 'blocked' }, // → deny → policy.deny[+stripped]
+      { kind: 'require', rule: 'dangerous', approver: 'human_approver', ttlMs: 1000, approvers: 1 },
+    ]
+
+    const eventKinds = EventKind.options as readonly string[]
+    for (const decision of decisions) {
+      const route = decidePermissionRoute(decision)
+      const kinds = permissionRouteJournalKinds(route.type)
+      if (kinds.length === 0) {
+        // Only the no-opinion default_human route is deliberately un-journaled.
+        expect(route.type).toBe('default_human')
+      } else {
+        // Every kind the production contract emits must be a real EventKind.
+        for (const kind of kinds) {
+          expect(eventKinds.includes(kind)).toBe(true)
+        }
+      }
+    }
+  })
+
+  test('exactly one route — the no-opinion default_human — is deliberately not journaled', async () => {
+    const { permissionRouteJournalKinds } = await import('./policy-dispatch.ts')
+    const all: RouteType[] = ['auto_allow', 'deny', 'require_human', 'default_human']
+    const silent = all.filter((t) => permissionRouteJournalKinds(t).length === 0)
+    // If a future change drops the journal write on a real decision branch
+    // (e.g. makes auto_allow silent), this fails loudly — that is the "no
+    // silent gap" guarantee at runtime, paired with the compile-time `never`
+    // inside permissionRouteJournalEvents.
+    expect(silent).toEqual(['default_human'])
+  })
+
+  test('the four explicit decision events + the deny stripped record are all real EventKinds', async () => {
+    const { EventKind } = await import('./journal.ts')
+    const kinds = EventKind.options as readonly string[]
+    // The bead's enumerated decision set. Removing any from journal.ts breaks this.
+    for (const k of ['policy.allow', 'policy.deny', 'policy.require', 'policy.approved']) {
+      expect(kinds.includes(k)).toBe(true)
+    }
+    // The deny path is a two-event sequence — the minimised record must exist too.
+    expect(kinds.includes('policy.deny.context_stripped')).toBe(true)
+  })
+
+  test('the real deny helper emits exactly the policy.deny + context_stripped pair (no gap on deny)', async () => {
+    // Drives PRODUCTION code (recordPolicyDenyToJournal) for the deny branch:
+    // proves deny is never a single-event gap. Full detail/ordering is covered
+    // by the ccsc-06s tests; here we assert only the no-gap kind pair.
+    const { recordPolicyDenyToJournal } = await import('./policy-dispatch.ts')
+    const kinds: string[] = []
+    await recordPolicyDenyToJournal(
+      async (input: Record<string, unknown>) => {
+        kinds.push(input.kind as string)
+        return { ok: true } as unknown
+      },
+      {
+        sessionKey: { channel: 'C1', thread: 'T1' },
+        toolName: 'Bash',
+        input: { cmd: 'rm -rf /' },
+        ruleId: 'no-destructive-bash',
+        reason: 'blocked',
+      },
+    )
+    expect(kinds).toEqual(['policy.deny', 'policy.deny.context_stripped'])
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Permission-route journal builders bind production code (ccsc-175)
+//
+// Before ccsc-175, server.ts wrote policy.allow / .require / .approved as inline
+// object literals at the dispatch site, and ran main() (plus top-level Slack
+// client construction) on import — so a test could not import the module to
+// drive those exact writes. ccsc-1iw.2's no-gaps guarantee therefore bound a
+// test-local route→kind switch, not production code.
+//
+// ccsc-175 extracts the event source into policy-dispatch.ts (side-effect-free,
+// importable): three pure builders + the exhaustive `permissionRouteJournalEvents`
+// dispatcher (a `never`-guard). server.ts now CALLS these, so the tests below
+// drive the REAL production event source and assert the exact EventKind written
+// for each decision branch — the assertion ccsc-1iw.2 could not make directly.
+// The deny pair stays on recordPolicyDenyToJournal (awaited + resilient before
+// the MCP deny notification, ccsc-06s); the final test pins the dispatcher's deny
+// arm to that helper so the two execution paths cannot drift.
+// ---------------------------------------------------------------------------
+describe('permission-route journal builders bind production code (ccsc-175)', () => {
+  test('buildPolicyAllowEvent emits a policy.allow with the auto-approve detail', async () => {
+    const { buildPolicyAllowEvent } = await import('./policy-dispatch.ts')
+    const ev = buildPolicyAllowEvent({
+      sessionKey: { channel: 'C1', thread: 'T1' },
+      toolName: 'Read',
+      input: { tool: 'Read', channel: 'C1', thread_ts: 'T1' },
+      ruleId: 'safe-reads',
+      correlationId: 'corr-123',
+    })
+    expect(ev.kind).toBe('policy.allow')
+    expect(ev.outcome).toBe('allow')
+    expect(ev.actor).toBe('claude_process')
+    expect(ev.ruleId).toBe('safe-reads')
+    expect(ev.correlationId).toBe('corr-123')
+    expect(ev.toolName).toBe('Read')
+  })
+
+  test('buildPolicyAllowEvent omits correlationId when no receipt was posted', async () => {
+    const { buildPolicyAllowEvent } = await import('./policy-dispatch.ts')
+    const ev = buildPolicyAllowEvent({
+      toolName: 'Read',
+      input: {},
+      ruleId: 'safe-reads',
+    })
+    expect(ev.kind).toBe('policy.allow')
+    expect(ev.correlationId).toBeUndefined()
+  })
+
+  test('buildPolicyRequireEvent emits a policy.require and merges approversNeeded into input', async () => {
+    const { buildPolicyRequireEvent } = await import('./policy-dispatch.ts')
+    const ev = buildPolicyRequireEvent({
+      sessionKey: { channel: 'C1', thread: 'T1' },
+      toolName: 'Bash',
+      input: { tool: 'Bash', channel: 'C1', thread_ts: 'T1' },
+      ruleId: 'dangerous',
+      approversNeeded: 2,
+    })
+    expect(ev.kind).toBe('policy.require')
+    expect(ev.outcome).toBe('require')
+    expect(ev.actor).toBe('claude_process')
+    expect(ev.ruleId).toBe('dangerous')
+    // The quorum size is recorded in the trace input, not a top-level field.
+    expect((ev.input as Record<string, unknown>).approversNeeded).toBe(2)
+    expect((ev.input as Record<string, unknown>).tool).toBe('Bash')
+  })
+
+  test('buildPolicyApprovedEvent emits a policy.approved attributed to human_approver', async () => {
+    const { buildPolicyApprovedEvent } = await import('./policy-dispatch.ts')
+    const approvers = ['U1', 'U2']
+    const ev = buildPolicyApprovedEvent({
+      sessionKey: { channel: 'C1', thread: 'T1' },
+      toolName: 'Bash',
+      ruleId: 'dangerous',
+      approversNeeded: 2,
+      approvers,
+    })
+    expect(ev.kind).toBe('policy.approved')
+    expect(ev.outcome).toBe('allow')
+    expect(ev.actor).toBe('human_approver')
+    expect(ev.ruleId).toBe('dangerous')
+    const input = ev.input as Record<string, unknown>
+    expect(input.approversNeeded).toBe(2)
+    expect(input.approvers).toEqual(['U1', 'U2'])
+    // The builder copies the approver list — mutating the source must not leak.
+    approvers.push('U3')
+    expect((ev.input as Record<string, unknown>).approvers).toEqual(['U1', 'U2'])
+  })
+
+  test('permissionRouteJournalEvents maps every route to its exact ordered EventKinds', async () => {
+    const { permissionRouteJournalEvents } = await import('./policy-dispatch.ts')
+    type PermissionRoute = import('./lib.ts').PermissionRoute
+    const ctx = {
+      sessionKey: { channel: 'C1', thread: 'T1' },
+      toolName: 'Bash',
+      input: { tool: 'Bash', channel: 'C1', thread_ts: 'T1' },
+      correlationId: 'corr-9',
+      approversNeeded: 3,
+      reason: 'blocked',
+    }
+    const cases: { route: PermissionRoute; kinds: string[] }[] = [
+      { route: { type: 'auto_allow', ruleId: 'r' }, kinds: ['policy.allow'] },
+      {
+        route: { type: 'deny', ruleId: 'r', reason: 'blocked' },
+        kinds: ['policy.deny', 'policy.deny.context_stripped'],
+      },
+      { route: { type: 'require_human', ruleId: 'r' }, kinds: ['policy.require'] },
+      { route: { type: 'default_human' }, kinds: [] },
+    ]
+    for (const { route, kinds } of cases) {
+      const events = permissionRouteJournalEvents(route, ctx)
+      expect(events.map((e) => e.kind as string)).toEqual(kinds)
+    }
+  })
+
+  test('auto_allow events carry the route ruleId and the ctx correlationId', async () => {
+    const { permissionRouteJournalEvents } = await import('./policy-dispatch.ts')
+    const [ev] = permissionRouteJournalEvents(
+      { type: 'auto_allow', ruleId: 'safe-reads' },
+      {
+        sessionKey: { channel: 'C1', thread: 'T1' },
+        toolName: 'Read',
+        input: { tool: 'Read' },
+        correlationId: 'corr-7',
+      },
+    )
+    expect(ev.kind).toBe('policy.allow')
+    expect(ev.ruleId).toBe('safe-reads')
+    expect(ev.correlationId).toBe('corr-7')
+  })
+
+  test('every decidePermissionRoute outcome maps to real EventKinds (no-gaps, driven through production)', async () => {
+    const { decidePermissionRoute } = await import('./lib.ts')
+    const { permissionRouteJournalEvents } = await import('./policy-dispatch.ts')
+    const { EventKind } = await import('./journal.ts')
+    type PolicyDecisionShape = import('./lib.ts').PolicyDecisionShape
+    const eventKinds = EventKind.options as readonly string[]
+    const ctx = { toolName: 'Bash', input: {}, approversNeeded: 1, reason: 'x' }
+
+    const decisions: PolicyDecisionShape[] = [
+      { kind: 'allow', rule: 'safe-reads' },
+      { kind: 'allow' },
+      { kind: 'deny', rule: 'no-shell', reason: 'blocked' },
+      { kind: 'require', rule: 'dangerous', approver: 'human_approver', ttlMs: 1000, approvers: 1 },
+    ]
+    for (const decision of decisions) {
+      const route = decidePermissionRoute(decision)
+      for (const ev of permissionRouteJournalEvents(route, ctx)) {
+        expect(eventKinds.includes(ev.kind)).toBe(true)
+      }
+    }
+  })
+
+  test('the dispatcher deny arm matches what recordPolicyDenyToJournal actually writes', async () => {
+    // Pins the two deny execution paths together: server.ts routes deny through
+    // recordPolicyDenyToJournal (awaited + resilient), while the exhaustive
+    // dispatcher declares the same pair for contract completeness. If either
+    // drifts, this fails.
+    const { permissionRouteJournalEvents, recordPolicyDenyToJournal } = await import(
+      './policy-dispatch.ts'
+    )
+    const ctx = {
+      sessionKey: { channel: 'C1', thread: 'T1' },
+      toolName: 'Bash',
+      input: { tool: 'Bash', channel: 'C1', thread_ts: 'T1' },
+      reason: 'blocked',
+    }
+    const dispatched = permissionRouteJournalEvents(
+      { type: 'deny', ruleId: 'no-shell', reason: 'blocked' },
+      ctx,
+    )
+
+    const written: Record<string, unknown>[] = []
+    await recordPolicyDenyToJournal(
+      async (input: Record<string, unknown>) => {
+        written.push(input)
+        return { ok: true } as unknown
+      },
+      {
+        sessionKey: ctx.sessionKey,
+        toolName: ctx.toolName,
+        input: ctx.input,
+        ruleId: 'no-shell',
+        reason: 'blocked',
+      },
+    )
+
+    // Same ordered kinds.
+    expect(dispatched.map((e) => e.kind as string)).toEqual(written.map((e) => e.kind as string))
+    // The forensic policy.deny event carries identical ruleId + reason on both paths.
+    expect(dispatched[0].ruleId).toBe(written[0].ruleId as string | undefined)
+    expect(dispatched[0].reason).toBe(written[0].reason as string | undefined)
+    // The stripped second event omits ruleId/reason on both paths.
+    expect(dispatched[1].ruleId).toBeUndefined()
+    expect(written[1].ruleId).toBeUndefined()
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Fail-closed access defaults — no fail-open footguns (ccsc-1iw.3)
+//
+// Regression test for the peer-runtime footgun in 000-docs/ADR-002: the peer
+// shipped fail-OPEN defaults (cross-thread reads default-ON; the sandbox
+// launched the agent with --dangerously-skip-permissions). CCSC's posture is
+// the inverse — every access decision DENIES / DROPS / THROWS when its config is
+// absent. THREAT-MODEL.md names this the fail-closed posture.
+//
+// This is the CONSOLIDATED audit checklist the ccsc-1iw.3 acceptance asks for:
+// one row per access default, each asserting the fail-closed DIRECTION, so a
+// future change that flips any default to fail-open is caught here by name.
+// Each surface's detailed behavior is tested in its own block above/below; this
+// block is the roll-up an auditor reads top-to-bottom.
+//
+// AUDIT RESULT (2026-06-12): every enumerated default is ALREADY fail-closed —
+// no flip required. ccsc-1iw.3 ships as a pin, not a fix.
+// ---------------------------------------------------------------------------
+describe('fail-closed access defaults — no fail-open footguns (ccsc-1iw.3)', () => {
+  const sessionKey = { channel: 'C1', thread: 'T1' }
+  const now = 1_700_000_000_000
+
+  // #1 Inbound — a regular channel with NO ChannelPolicy is not implicitly trusted.
+  test('default #1: a channel message with no ChannelPolicy is dropped', async () => {
+    const result = await gate(
+      { user: 'U_RANDO', channel: 'C_UNKNOWN', channel_type: 'channel' },
+      makeOpts(),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  // #2 Inbound — peer bots are opt-IN (allowBotIds), never opt-out. No list ⇒ drop.
+  test('default #2: a peer-bot message with no allowBotIds is dropped', async () => {
+    const result = await gate(
+      { bot_id: 'B_PEER', user: 'U_PEER', channel: 'C_UNKNOWN', channel_type: 'channel' },
+      makeOpts(),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  // #3 Inbound DM — allowFrom defaults to [] (hardened); a stranger DM is dropped.
+  test('default #3: a DM from a user not in allowFrom is dropped', async () => {
+    const result = await gate(
+      { user: 'U_RANDO', channel: 'D1', channel_type: 'im', text: 'hi' },
+      makeOpts(),
+    )
+    expect(result.action).toBe('drop')
+  })
+
+  // #4 Policy — an unmatched MUTATING tool denies by omission (deny-by-default set).
+  test('default #4: an unmatched mutating tool (upload_file) denies by omission', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const decision = evaluate(
+      { tool: 'upload_file', input: {}, sessionKey, actor: 'claude_process' },
+      [],
+      now,
+    )
+    expect(decision.kind).toBe('deny')
+  })
+
+  // #5 Policy — an unmatched READ tool NEVER auto-allows; it routes to a human.
+  test('default #5: an unmatched read tool never auto-allows (routes to human approval)', async () => {
+    const { evaluate } = await import('./policy.ts')
+    const { decidePermissionRoute } = await import('./lib.ts')
+    const decision = evaluate(
+      { tool: 'Read', input: {}, sessionKey, actor: 'claude_process' },
+      [],
+      now,
+    )
+    const route = decidePermissionRoute(decision)
+    // The no-rule allow must fall to Block Kit human approval, not auto_allow.
+    expect(route.type).toBe('default_human')
+    expect(route.type).not.toBe('auto_allow')
+  })
+
+  // #6 Outbound — replies go only to delivered/allowlisted channels. Unknown ⇒ throw.
+  test('default #6: outbound to an undelivered, non-allowlisted channel is refused', () => {
+    expect(() =>
+      assertOutboundAllowed('C_UNKNOWN', undefined, makeAccess(), new Set<string>()),
+    ).toThrow(/not in the allowlist or delivered/)
+  })
+
+  // #7 File send — input-validation fail-closed: empty path and ".." are rejected.
+  test('default #7: the file-send guard rejects an empty path and a ".." path', () => {
+    expect(() => assertSendable('', '/tmp/inbox')).toThrow(/empty or not a string/)
+    expect(() => assertSendable('/tmp/inbox/../escape', '/tmp/inbox')).toThrow(/"\.\." component/)
+  })
+
+  // #8 Manifest publish — allowlist-gated; a non-allowlisted user is refused.
+  test('default #8: manifest publish is refused for a non-allowlisted user', async () => {
+    const { assertPublishAllowed } = await import('./lib.ts')
+    expect(() => assertPublishAllowed('U_RANDO', makeAccess())).toThrow(/not in access\.allowFrom/)
   })
 })
 
@@ -8902,6 +12583,9 @@ describe('Supervisor wiring (ccsc-jqs)', () => {
       deactivate: async () => {},
       clearQuarantine: () => {},
       reapIdle: async () => {},
+      recoverOnStartup: async () => ({ scanned: 0, requeued: [], orphaned: [] }),
+      pendingDeliveries: async () => [],
+      drainOutbox: async () => ({ scanned: 0, delivered: [], deadLettered: [], skipped: [] }),
       shutdown: () => {
         shutdownCalled = true
         return new Promise<void>((res) => {
@@ -10317,6 +14001,315 @@ describe('detectShadowing (ccsc-4g8) — backward compatibility', () => {
 })
 
 // ---------------------------------------------------------------------------
+// policy.ts mutation-survivor kills (ccsc-2et)
+// ---------------------------------------------------------------------------
+//
+// Targets the real surviving mutants from the CI Mutation run that dropped
+// policy.ts to 73.91% (000-docs/MUTATION_REPORT.md, 2026-05-31). Survivors
+// were extracted from the json reporter's mutation.json (ccsc-2et). The
+// v0.10 tier-aware rewrite (ccsc-8pw / ccsc-4g8) added decision branches to
+// matchesIntersect / matchSubsetOrEqual / evaluate without enough
+// negative-path + boundary + exact-message assertions. Each test below names
+// the source line(s) and mutator family it kills so a future reader can map
+// the assertion back to the survivor it was written for.
+
+describe('matchesIntersect — field-boundary survivor kills (ccsc-2et)', () => {
+  // Lines 695/696/700: `a.X !== undefined && b.X !== undefined && a.X !== b.X`.
+  // Existing tests only exercised tool-equal-both-sides; the ConditionalExpression,
+  // EqualityOperator, and LogicalOperator mutants on the tool/channel/actor
+  // guards survived because no test drove "both set and DIFFER" or "one side only".
+
+  test('different tool on both sides — non-intersecting (line 695)', () => {
+    // Kills 695 `a.tool !== b.tool` → `===` and the conditional → true mutant.
+    expect(matchesIntersect({ tool: 'Bash' }, { tool: 'Write' })).toBe(false)
+  })
+
+  test('tool only on one side — intersects (line 695 undefined guards)', () => {
+    // Kills the `a.tool !== undefined && b.tool !== undefined` → `||` logical
+    // mutant: with b.tool unset the && short-circuits (no false-return), but the
+    // || mutant would proceed to `a.tool !== b.tool` (Bash !== undefined) → false.
+    expect(matchesIntersect({ tool: 'Bash' }, { channel: 'C001' })).toBe(true)
+  })
+
+  test('different channel on both sides — non-intersecting (line 696)', () => {
+    expect(
+      matchesIntersect({ tool: 'Bash', channel: 'C001' }, { tool: 'Bash', channel: 'C002' }),
+    ).toBe(false)
+  })
+
+  test('channel only on one side — intersects (line 696 undefined guards)', () => {
+    expect(matchesIntersect({ channel: 'C001' }, { tool: 'Bash' })).toBe(true)
+  })
+
+  test('different actor on both sides — non-intersecting (line 700)', () => {
+    expect(
+      matchesIntersect(
+        { tool: 'Bash', actor: 'session_owner' },
+        { tool: 'Bash', actor: 'claude_process' },
+      ),
+    ).toBe(false)
+  })
+
+  test('actor only on one side — intersects (line 700 undefined guards)', () => {
+    expect(matchesIntersect({ actor: 'session_owner' }, { tool: 'Bash' })).toBe(true)
+  })
+
+  test('pathPrefix only on one side — intersects (line 702 `&&` → `||`)', () => {
+    // Kills 702 `a.pathPrefix !== undefined && b.pathPrefix !== undefined` → `||`:
+    // with b unset the && skips the block (return true); the || mutant enters and
+    // dereferences b.pathPrefix.startsWith → throws / wrong-answer.
+    expect(matchesIntersect({ tool: 'Write', pathPrefix: '/home/a' }, { tool: 'Write' })).toBe(true)
+  })
+
+  test('a is the longer pathPrefix, b is its prefix — intersects (line 705)', () => {
+    // The existing "one prefixes the other" test put the SHORTER path in `a`,
+    // so the `!a.startsWith(b + sep)` clause on line 705 was always vacuously
+    // true and its ArithmeticOperator (`b.pathPrefix - sep`) and MethodExpression
+    // (`startsWith` → `endsWith`) mutants survived. Reversing the order makes
+    // line 705 the load-bearing clause.
+    expect(
+      matchesIntersect(
+        { tool: 'Write', pathPrefix: '/home/jeremy/projects' },
+        { tool: 'Write', pathPrefix: '/home/jeremy' },
+      ),
+    ).toBe(true)
+  })
+})
+
+describe('matchSubsetOrEqual via detectShadowing — within-tier subset survivor kills (ccsc-2et)', () => {
+  // matchSubsetOrEqual is private; it is reached through detectShadowing's
+  // Pass-1 within-tier subset check (default-tier rules, broader rule first).
+  // Lines 648 (actor), 650-657 (pathPrefix), 661-664 (argEquals) had
+  // Equality/Conditional/Logical/Method/Arithmetic survivors because the
+  // existing corpus exercised only the tool+channel subset path.
+
+  const withinTier = (earlier: Record<string, unknown>, later: Record<string, unknown>): number => {
+    const rules = [
+      { id: 'earlier', priority: 100, effect: 'auto_approve', match: earlier },
+      { id: 'later', priority: 100, effect: 'auto_approve', match: later },
+    ] as PolicyRule[]
+    return detectShadowingDirect(rules).filter((w) => !w.crossTier).length
+  }
+
+  // ── actor (line 648) ──
+  test('equal actor → earlier shadows later (line 648 `!==` → `===`)', () => {
+    expect(
+      withinTier(
+        { tool: 'Bash', actor: 'session_owner' },
+        { tool: 'Bash', actor: 'session_owner' },
+      ),
+    ).toBe(1)
+  })
+
+  test('different actor → no shadow (line 648 EqualityOperator)', () => {
+    expect(
+      withinTier(
+        { tool: 'Bash', actor: 'session_owner' },
+        { tool: 'Bash', actor: 'claude_process' },
+      ),
+    ).toBe(0)
+  })
+
+  // ── pathPrefix (lines 650-657) ──
+  test('earlier path is a prefix of later → shadow (lines 654-655)', () => {
+    expect(
+      withinTier({ tool: 'Write', pathPrefix: '/home' }, { tool: 'Write', pathPrefix: '/home/x' }),
+    ).toBe(1)
+  })
+
+  test('earlier constrains pathPrefix, later does not → no shadow (line 651)', () => {
+    // Kills the `inner.pathPrefix === undefined` → conditional/false mutant.
+    expect(withinTier({ tool: 'Write', pathPrefix: '/home' }, { tool: 'Write' })).toBe(0)
+  })
+
+  test('disjoint pathPrefixes → no shadow (lines 654-655 startsWith/+sep)', () => {
+    expect(
+      withinTier(
+        { tool: 'Write', pathPrefix: '/home/a' },
+        { tool: 'Write', pathPrefix: '/home/b' },
+      ),
+    ).toBe(0)
+  })
+
+  // ── argEquals (lines 661-664) ──
+  test('equal argEquals → shadow (line 664 jsonEqual true path)', () => {
+    expect(
+      withinTier(
+        { tool: 'Bash', argEquals: { cmd: 'ls' } },
+        { tool: 'Bash', argEquals: { cmd: 'ls' } },
+      ),
+    ).toBe(1)
+  })
+
+  test('earlier constrains argEquals, later does not → no shadow (line 662)', () => {
+    expect(withinTier({ tool: 'Bash', argEquals: { cmd: 'ls' } }, { tool: 'Bash' })).toBe(0)
+  })
+
+  test('argEquals value disagreement → no shadow (line 664 jsonEqual false path)', () => {
+    expect(
+      withinTier(
+        { tool: 'Bash', argEquals: { cmd: 'ls' } },
+        { tool: 'Bash', argEquals: { cmd: 'rm' } },
+      ),
+    ).toBe(0)
+  })
+})
+
+describe('policy warning/decision exact-text + boundary survivor kills (ccsc-2et)', () => {
+  test('within-tier shadow message is exact (line 608 StringLiteral)', async () => {
+    const { detectShadowing } = await import('./policy.ts')
+    const rules = [
+      { id: 'r1', priority: 100, effect: 'auto_approve', match: { tool: 'Bash' } },
+      { id: 'r2', priority: 100, effect: 'auto_approve', match: { tool: 'Bash', channel: 'C001' } },
+    ] as PolicyRule[]
+    const warnings = detectShadowing(rules)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]!.message).toBe(
+      "rule 'r2' is shadowed by earlier rule 'r1' — every call the later rule would match is already caught by the earlier one",
+    )
+  })
+
+  test('checkMonotonicity violation message is exact (line 765 StringLiteral)', async () => {
+    const { checkMonotonicity } = await import('./policy.ts')
+    const prev = [
+      {
+        id: 'deny-all',
+        priority: 100,
+        effect: 'deny',
+        reason: 'x',
+        match: { tool: 'upload_file' },
+      },
+    ] as PolicyRule[]
+    const next = [
+      {
+        id: 'deny-all',
+        priority: 100,
+        effect: 'deny',
+        reason: 'x',
+        match: { tool: 'upload_file' },
+      },
+      {
+        id: 'allow-pdf',
+        priority: 100,
+        effect: 'auto_approve',
+        match: { tool: 'upload_file', argEquals: { mime: 'pdf' } },
+      },
+    ] as PolicyRule[]
+    const violations = checkMonotonicity(prev, next)
+    expect(violations).toHaveLength(1)
+    expect(violations[0]!.message).toBe(
+      "new auto_approve rule 'allow-pdf' weakens existing deny 'deny-all' — reload refused",
+    )
+  })
+
+  test('detectBroadAutoApprove message is exact (lines 811-813 StringLiterals)', async () => {
+    const { detectBroadAutoApprove } = await import('./policy.ts')
+    const rules = [
+      {
+        id: 'too-broad',
+        priority: 100,
+        effect: 'auto_approve',
+        match: { actor: 'claude_process' },
+      },
+    ] as PolicyRule[]
+    const warnings = detectBroadAutoApprove(rules)
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]!.message).toBe(
+      "auto_approve rule 'too-broad' has no 'tool' or 'pathPrefix' in its match — " +
+        'this rule auto-approves ANY tool call within its scope, which is almost always ' +
+        'a misconfiguration. Narrow the rule or convert to require_approval.',
+    )
+  })
+
+  test('admin auto_approve vs admin deny produces no cross-tier warning (line 624 `=== admin`)', async () => {
+    // Pass-2 skips lower-tier auto_approve only AFTER the `effectiveTier === 'admin'`
+    // continue. The StringLiteral mutant ('admin' → "") would stop skipping admin
+    // rules and wrongly emit a cross-tier warning for an admin/admin pair.
+    const { detectShadowing } = await import('./policy.ts')
+    const rules = [
+      {
+        id: 'admin-deny',
+        priority: 100,
+        effect: 'deny',
+        reason: 'locked',
+        match: { tool: 'Bash', tier: 'admin' },
+      },
+      {
+        id: 'admin-allow',
+        priority: 100,
+        effect: 'auto_approve',
+        match: { tool: 'Bash', tier: 'admin' },
+      },
+    ] as PolicyRule[]
+    const warnings = detectShadowing(rules)
+    expect(warnings.filter((w) => w.crossTier === true)).toEqual([])
+  })
+
+  test('approval exactly at expiry millisecond does NOT allow (line 427 `>` → `>=`)', async () => {
+    const { evaluate, approvalKey } = await import('./policy.ts')
+    const rules = [
+      {
+        id: 'r1',
+        priority: 100,
+        effect: 'require_approval',
+        ttlMs: 60_000,
+        match: { tool: 'reply' },
+      },
+    ] as PolicyRule[]
+    // now === ttlExpires === 1000: `ttlExpires > now` is false (expired), so the
+    // decision must be `require`. The `>=` mutant would flip this to `allow`.
+    const approvals = new Map([
+      [approvalKey('r1', { channel: 'C_CHAN', thread: 'T1.0' }), { ttlExpires: 1_000 }],
+    ])
+    const decision = evaluate(
+      {
+        tool: 'reply',
+        input: {},
+        sessionKey: { channel: 'C_CHAN', thread: 'T1.0' },
+        actor: 'claude_process',
+      },
+      rules,
+      1_000,
+      { approvals },
+    )
+    expect(decision.kind).toBe('require')
+  })
+
+  test('checkMonotonicity only compares against existing DENY rules (line 752 `.filter`)', async () => {
+    // A broad auto_approve in prev + a narrower auto_approve added in next must
+    // NOT be a violation — only deny-weakening is. The `.filter(deny)` → bare
+    // `prev` mutant would compare the new rule against the prev auto_approve and
+    // emit a false violation.
+    const { checkMonotonicity } = await import('./policy.ts')
+    const prev = [
+      { id: 'broad-allow', priority: 100, effect: 'auto_approve', match: { tool: 'Bash' } },
+    ] as PolicyRule[]
+    const next = [
+      { id: 'broad-allow', priority: 100, effect: 'auto_approve', match: { tool: 'Bash' } },
+      {
+        id: 'new-allow',
+        priority: 100,
+        effect: 'auto_approve',
+        match: { tool: 'Bash', channel: 'C001' },
+      },
+    ] as PolicyRule[]
+    expect(checkMonotonicity(prev, next)).toEqual([])
+  })
+
+  test('policyDigest is independent of authoring order (line 548 sort comparator)', async () => {
+    // The sort-by-id comparator makes the digest a content fingerprint, not an
+    // order fingerprint. A comparator that always returns 0 (ConditionalExpression
+    // mutants) would leave the array in input order → different digests.
+    const { policyDigest } = await import('./policy.ts')
+    const a = { id: 'aaa', priority: 100, effect: 'auto_approve', match: { tool: 'Bash' } }
+    const b = { id: 'bbb', priority: 100, effect: 'deny', reason: 'x', match: { tool: 'Write' } }
+    const rulesAB = [a, b] as PolicyRule[]
+    const rulesBA = [b, a] as PolicyRule[]
+    expect(policyDigest(rulesAB)).toBe(policyDigest(rulesBA))
+  })
+})
+
+// ---------------------------------------------------------------------------
 // Journal v2 signing + verifier (ccsc-22l)
 // ---------------------------------------------------------------------------
 
@@ -11510,6 +15503,139 @@ describe('ccsc-3w0 — parseAdminCommand', () => {
     const { parseAdminCommand } = await import('./admin.ts')
     expect(parseAdminCommand('<@U_BOT> !clear', envelope)).toBeNull()
   })
+
+  test('parses !mute-status into AdminMuteStatusCommand (ccsc-yl6k9)', async () => {
+    const { parseAdminCommand } = await import('./admin.ts')
+    expect(parseAdminCommand('!mute-status', envelope)).toEqual({
+      kind: 'mute-status',
+      ...envelope,
+    })
+  })
+
+  test('parses !rate-limit into AdminRateLimitCommand (ccsc-yl6k9)', async () => {
+    const { parseAdminCommand } = await import('./admin.ts')
+    expect(parseAdminCommand('!rate-limit', envelope)).toEqual({ kind: 'rate-limit', ...envelope })
+  })
+
+  test('rejects !mute-status / !rate-limit with an argument (ccsc-yl6k9)', async () => {
+    const { parseAdminCommand } = await import('./admin.ts')
+    expect(parseAdminCommand('!mute-status foo', envelope)).toBeNull()
+    expect(parseAdminCommand('!rate-limit 5', envelope)).toBeNull()
+  })
+})
+
+describe('ccsc-yl6k9 — read-only admin verbs (mute-status / rate-limit)', () => {
+  const envelope = {
+    channelId: 'C_OPS',
+    requestedBy: 'U_ALICE',
+    threadTs: '1700000000.000100',
+    messageTs: '1700000000.000100',
+  }
+
+  function baseDeps(
+    overrides: Partial<import('./admin.ts').DispatchDeps> = {},
+  ): import('./admin.ts').DispatchDeps {
+    return {
+      isAllowed: () => true,
+      journalWrite: async () => undefined,
+      quiesceAndDeactivate: async () => {},
+      sendTmuxKeys: async () => {},
+      issueChallenge: async () => ({ nonce: 'x', expiresAt: 0 }),
+      verifyChallenge: () => ({ ok: false, reason: 'unknown' }),
+      postReaction: async () => {},
+      ...overrides,
+    }
+  }
+
+  test('!mute-status returns a status outcome listing active mutes', async () => {
+    const { dispatchAdminCommand } = await import('./admin.ts')
+    const { createMuteStore } = await import('./mute-store.ts')
+    const store = createMuteStore()
+    store.mute('C_OPS', 'B_NOISY', 1_000_000 + 60_000, 'U_ALICE', 1_000_000)
+    const result = await dispatchAdminCommand(
+      { kind: 'mute-status', ...envelope },
+      baseDeps({ muteStore: store, now: () => 1_000_000 }),
+    )
+    expect(result.kind).toBe('status')
+    if (result.kind === 'status') {
+      expect(result.verb).toBe('mute-status')
+      expect(result.message).toContain('B_NOISY')
+    }
+  })
+
+  test('!mute-status reports no active mutes when the store is empty', async () => {
+    const { dispatchAdminCommand } = await import('./admin.ts')
+    const { createMuteStore } = await import('./mute-store.ts')
+    const result = await dispatchAdminCommand(
+      { kind: 'mute-status', ...envelope },
+      baseDeps({ muteStore: createMuteStore(), now: () => 1_000_000 }),
+    )
+    expect(result.kind).toBe('status')
+    if (result.kind === 'status') expect(result.message).toMatch(/No active/i)
+  })
+
+  test('!rate-limit reports the effective per-bot + channel-breaker thresholds', async () => {
+    const { dispatchAdminCommand } = await import('./admin.ts')
+    const result = await dispatchAdminCommand(
+      { kind: 'rate-limit', ...envelope },
+      baseDeps({
+        getChannelRateLimits: () => ({
+          peerBot: { count: 10, windowMs: 60_000 },
+          channel: { count: 40, windowMs: 60_000 },
+        }),
+      }),
+    )
+    expect(result.kind).toBe('status')
+    if (result.kind === 'status') {
+      expect(result.message).toContain('10 msgs / 60s')
+      expect(result.message).toContain('40 msgs / 60s')
+    }
+  })
+
+  test('!rate-limit shows "disabled" when a limit is { count: 0 }', async () => {
+    const { dispatchAdminCommand } = await import('./admin.ts')
+    const result = await dispatchAdminCommand(
+      { kind: 'rate-limit', ...envelope },
+      baseDeps({
+        getChannelRateLimits: () => ({
+          peerBot: { count: 0, windowMs: 0 },
+          channel: { count: 40, windowMs: 60_000 },
+        }),
+      }),
+    )
+    expect(result.kind).toBe('status')
+    if (result.kind === 'status') expect(result.message).toContain('disabled')
+  })
+
+  test('!rate-limit degrades gracefully when the resolver returns undefined (ccsc-yl6k9)', async () => {
+    // Defensive against a malformed/missing config (Gemini, PR #249).
+    const { dispatchAdminCommand } = await import('./admin.ts')
+    const result = await dispatchAdminCommand(
+      { kind: 'rate-limit', ...envelope },
+      baseDeps({ getChannelRateLimits: () => undefined as unknown as never }),
+    )
+    expect(result.kind).toBe('status')
+    if (result.kind === 'status') expect(result.message).toMatch(/unavailable/i)
+  })
+
+  test('read-only verbs are allowlist-gated — non-allowlisted user denied, not journaled', async () => {
+    const { dispatchAdminCommand } = await import('./admin.ts')
+    const { createMuteStore } = await import('./mute-store.ts')
+    const journal: unknown[] = []
+    const result = await dispatchAdminCommand(
+      { kind: 'mute-status', ...envelope },
+      baseDeps({
+        isAllowed: () => false,
+        journalWrite: async (i) => {
+          journal.push(i)
+          return undefined
+        },
+        muteStore: createMuteStore(),
+      }),
+    )
+    expect(result.kind).toBe('denied')
+    expect(journal.length).toBe(0) // reads are not journaled
+  })
 })
 
 describe('ccsc-3w0 — stripBotMention (Gemini #1 from original PR #157)', () => {
@@ -12396,6 +16522,319 @@ describe('ccsc-ele — Gemini #181 review fixes', () => {
 // A→B→A runaway loops when multiple peer bots are opted into one
 // channel via allowBotIds.
 
+describe('ccsc-0k7x2 — channel-wide circuit breaker', () => {
+  test('checkChannel counts ALL bots together and trips at the threshold', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    const cfg = { count: 3, windowMs: 60_000 }
+    // Three different senders, each well under any per-bot cap, together exhaust
+    // the channel aggregate: 3 allowed, the 4th (from any bot) trips the ring.
+    expect(store.checkChannel('C_OPS', 1_000_000, cfg)).toBe(true)
+    expect(store.checkChannel('C_OPS', 1_000_100, cfg)).toBe(true)
+    expect(store.checkChannel('C_OPS', 1_000_200, cfg)).toBe(true)
+    expect(store.checkChannel('C_OPS', 1_000_300, cfg)).toBe(false)
+  })
+
+  test('checkChannel is independent per channel', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    const cfg = { count: 1, windowMs: 60_000 }
+    expect(store.checkChannel('C_A', 1_000_000, cfg)).toBe(true)
+    expect(store.checkChannel('C_A', 1_000_100, cfg)).toBe(false)
+    expect(store.checkChannel('C_B', 1_000_200, cfg)).toBe(true)
+  })
+
+  test('checkChannel resets after the window slides', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    const cfg = { count: 1, windowMs: 60_000 }
+    expect(store.checkChannel('C_OPS', 1_000_000, cfg)).toBe(true)
+    expect(store.checkChannel('C_OPS', 1_000_100, cfg)).toBe(false)
+    // Past the window → old entry pruned, allowed again
+    expect(store.checkChannel('C_OPS', 1_000_000 + 60_001, cfg)).toBe(true)
+  })
+
+  test('checkChannel { count: 0 } disables (always allows)', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    const cfg = { count: 0, windowMs: 0 }
+    for (let i = 0; i < 100; i++) {
+      expect(store.checkChannel('C_OPS', 1_000_000 + i, cfg)).toBe(true)
+    }
+  })
+
+  test('prune sweeps channel-aggregate buckets too', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    const cfg = { count: 5, windowMs: 60_000 }
+    store.checkChannel('C_OPS', 1_000_000, cfg)
+    // Long after the window, prune removes the stale channel bucket.
+    expect(store.prune(1_000_000 + 120_000, 60_000)).toBeGreaterThanOrEqual(1)
+  })
+
+  test('gate trips an A→B→C→A ring with rate.channel_cycle though each bot is under its per-bot cap', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const { gate } = await import('./lib.ts')
+    const store = createPeerBotRateLimitStore()
+    const access: Access = {
+      dmPolicy: 'allowlist',
+      allowFrom: [],
+      channels: {
+        C_RING: {
+          requireMention: false,
+          allowFrom: [],
+          allowBotIds: ['U_A', 'U_B', 'U_C'],
+          peerBotRateLimit: { count: 100, windowMs: 60_000 }, // generous → per-bot never trips first
+          channelCircuitBreaker: { count: 5, windowMs: 60_000 },
+        },
+      },
+      pending: {},
+    }
+    let now = 1_000_000
+    const opts = {
+      access,
+      staticMode: true,
+      saveAccess: () => {},
+      botUserId: 'U_BRIDGE_BOT',
+      selfBotId: 'B_BRIDGE',
+      selfAppId: 'A_BRIDGE',
+      peerBotRateLimitStore: store,
+      now: () => now,
+    }
+    const ring = ['U_A', 'U_B', 'U_C', 'U_A', 'U_B'] // 5 messages, each sender ≤ 2
+    for (const user of ring) {
+      const r = await gate(
+        {
+          type: 'message',
+          channel: 'C_RING',
+          user,
+          bot_id: `B_${user}`,
+          text: 'looping',
+          ts: '1700000000.000100',
+        },
+        opts,
+      )
+      expect(r.action).not.toBe('drop')
+      now += 100
+    }
+    // 6th message: channel aggregate (5) is at threshold → breaker trips.
+    const tripped = await gate(
+      {
+        type: 'message',
+        channel: 'C_RING',
+        user: 'U_C',
+        bot_id: 'B_U_C',
+        text: 'looping',
+        ts: '1700000000.000100',
+      },
+      opts,
+    )
+    expect(tripped.action).toBe('drop')
+    expect(tripped.dropReason).toBe('rate.channel_cycle')
+  })
+
+  test('gate channelCircuitBreaker { count: 0 } disables the breaker', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const { gate } = await import('./lib.ts')
+    const store = createPeerBotRateLimitStore()
+    const access: Access = {
+      dmPolicy: 'allowlist',
+      allowFrom: [],
+      channels: {
+        C_RING: {
+          requireMention: false,
+          allowFrom: [],
+          allowBotIds: ['U_A'],
+          peerBotRateLimit: { count: 0, windowMs: 0 },
+          channelCircuitBreaker: { count: 0, windowMs: 0 },
+        },
+      },
+      pending: {},
+    }
+    const opts = {
+      access,
+      staticMode: true,
+      saveAccess: () => {},
+      botUserId: 'U_BRIDGE_BOT',
+      selfBotId: 'B_BRIDGE',
+      selfAppId: 'A_BRIDGE',
+      peerBotRateLimitStore: store,
+      now: () => 1_000_000,
+    }
+    for (let i = 0; i < 50; i++) {
+      const r = await gate(
+        {
+          type: 'message',
+          channel: 'C_RING',
+          user: 'U_A',
+          bot_id: 'B_A',
+          text: 'x',
+          ts: '1700000000.000100',
+        },
+        opts,
+      )
+      expect(r.dropReason).not.toBe('rate.channel_cycle')
+    }
+  })
+})
+
+describe('ccsc-4e9bf — backpressure + agents-online', () => {
+  test('resolveMaxConcurrentSessions parses a positive integer', async () => {
+    const { resolveMaxConcurrentSessions } = await import('./supervisor.ts')
+    expect(resolveMaxConcurrentSessions({ SLACK_MAX_CONCURRENT_SESSIONS: '50' })).toBe(50)
+  })
+
+  test('resolveMaxConcurrentSessions → undefined for unset/empty/non-numeric/non-positive', async () => {
+    const { resolveMaxConcurrentSessions } = await import('./supervisor.ts')
+    expect(resolveMaxConcurrentSessions({})).toBeUndefined()
+    expect(resolveMaxConcurrentSessions({ SLACK_MAX_CONCURRENT_SESSIONS: '' })).toBeUndefined()
+    expect(resolveMaxConcurrentSessions({ SLACK_MAX_CONCURRENT_SESSIONS: 'abc' })).toBeUndefined()
+    expect(resolveMaxConcurrentSessions({ SLACK_MAX_CONCURRENT_SESSIONS: '0' })).toBeUndefined()
+    expect(resolveMaxConcurrentSessions({ SLACK_MAX_CONCURRENT_SESSIONS: '-5' })).toBeUndefined()
+  })
+
+  test('resolveMaxConcurrentSessions floors a float', async () => {
+    const { resolveMaxConcurrentSessions } = await import('./supervisor.ts')
+    expect(resolveMaxConcurrentSessions({ SLACK_MAX_CONCURRENT_SESSIONS: '3.9' })).toBe(3)
+  })
+
+  describe('supervisor cap', () => {
+    let rawRoot: string
+    let tmpRoot: string
+    const journalEvents: Array<{ kind: string; reason?: string }> = []
+    beforeEach(() => {
+      rawRoot = mkdtempSync(join(tmpdir(), 'bp-'))
+      tmpRoot = realpathSync.native(rawRoot)
+      journalEvents.length = 0
+    })
+    afterEach(() => rmSync(rawRoot, { recursive: true, force: true }))
+    function makeSup(maxConcurrentSessions?: number) {
+      return createSessionSupervisor({
+        stateRoot: tmpRoot,
+        log: () => {},
+        clock: () => 1_700_000_000_000,
+        maxConcurrentSessions,
+        journal: {
+          writeEvent: async (e: { kind: string; reason?: string }) => {
+            journalEvents.push(e)
+            return {}
+          },
+        } as unknown as import('./journal.ts').JournalWriter,
+      })
+    }
+
+    test('allows new sessions up to the cap, rejects the next new one', async () => {
+      const sup = makeSup(2)
+      await sup.activate({ channel: 'C1', thread: 'T1' }, 'U1')
+      await sup.activate({ channel: 'C2', thread: 'T2' }, 'U2')
+      await expect(sup.activate({ channel: 'C3', thread: 'T3' }, 'U3')).rejects.toThrow(
+        /maxConcurrentSessions/,
+      )
+    })
+
+    test('reactivating an already-live session is never capped', async () => {
+      const sup = makeSup(1)
+      const a = await sup.activate({ channel: 'C1', thread: 'T1' }, 'U1')
+      const again = await sup.activate({ channel: 'C1', thread: 'T1' }, 'U1')
+      expect(again).toBe(a)
+    })
+
+    test('the over-cap rejection is journaled as session.activate_rejected', async () => {
+      const sup = makeSup(1)
+      await sup.activate({ channel: 'C1', thread: 'T1' }, 'U1')
+      await expect(sup.activate({ channel: 'C2', thread: 'T2' }, 'U2')).rejects.toThrow()
+      await new Promise((r) => setTimeout(r, 0)) // flush the fire-and-forget journal write
+      const rej = journalEvents.find((e) => e.kind === 'session.activate_rejected')
+      expect(rej).toBeDefined()
+      expect(rej?.reason).toContain('maxConcurrentSessions')
+    })
+
+    test('undefined cap = unlimited (no rejection across many activations)', async () => {
+      const sup = makeSup(undefined)
+      for (let i = 0; i < 12; i++) {
+        await sup.activate({ channel: `C${i}`, thread: 'T' }, 'U')
+      }
+      expect(journalEvents.find((e) => e.kind === 'session.activate_rejected')).toBeUndefined()
+    })
+
+    test('cap counts DISTINCT sessions under concurrency — cap=2, 3 fired at once → 2 ok, 1 rejected', async () => {
+      // Guards the live∪activating double-count fix (Gemini, PR #250): a key
+      // briefly in both maps must not inflate the count.
+      const sup = makeSup(2)
+      const results = await Promise.allSettled([
+        sup.activate({ channel: 'C1', thread: 'T' }, 'U'),
+        sup.activate({ channel: 'C2', thread: 'T' }, 'U'),
+        sup.activate({ channel: 'C3', thread: 'T' }, 'U'),
+      ])
+      expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(2)
+      expect(results.filter((r) => r.status === 'rejected')).toHaveLength(1)
+    })
+  })
+
+  test('activeBots lists bots active within the window, excluding stale + other channels', async () => {
+    const { createPeerBotRateLimitStore } = await import('./peer-bot-rate-limit.ts')
+    const store = createPeerBotRateLimitStore()
+    const cfg = { count: 100, windowMs: 60_000 }
+    store.check('C_OPS', 'B_alice', 1_000_000, cfg)
+    store.check('C_OPS', 'B_bob', 1_000_000, cfg)
+    store.check('C_OTHER', 'B_carol', 1_000_000, cfg)
+    expect(store.activeBots('C_OPS', 1_002_000, 5_000).sort()).toEqual(['B_alice', 'B_bob'])
+    // After the window, none are active.
+    expect(store.activeBots('C_OPS', 1_000_000 + 10_000, 5_000)).toEqual([])
+  })
+
+  const envelope = {
+    channelId: 'C_OPS',
+    requestedBy: 'U_ALICE',
+    threadTs: '1700000000.000100',
+    messageTs: '1700000000.000100',
+  }
+  function adminDeps(
+    overrides: Partial<import('./admin.ts').DispatchDeps> = {},
+  ): import('./admin.ts').DispatchDeps {
+    return {
+      isAllowed: () => true,
+      journalWrite: async () => undefined,
+      quiesceAndDeactivate: async () => {},
+      sendTmuxKeys: async () => {},
+      issueChallenge: async () => ({ nonce: 'x', expiresAt: 0 }),
+      verifyChallenge: () => ({ ok: false, reason: 'unknown' }),
+      postReaction: async () => {},
+      ...overrides,
+    }
+  }
+
+  test('parses !agents; rejects !agents with an argument', async () => {
+    const { parseAdminCommand } = await import('./admin.ts')
+    expect(parseAdminCommand('!agents', envelope)).toEqual({ kind: 'agents', ...envelope })
+    expect(parseAdminCommand('!agents foo', envelope)).toBeNull()
+  })
+
+  test('!agents lists active peer agents', async () => {
+    const { dispatchAdminCommand } = await import('./admin.ts')
+    const result = await dispatchAdminCommand(
+      { kind: 'agents', ...envelope },
+      adminDeps({ getActiveAgents: () => ['B_alice', 'B_bob'] }),
+    )
+    expect(result.kind).toBe('status')
+    if (result.kind === 'status') {
+      expect(result.verb).toBe('agents')
+      expect(result.message).toContain('B_alice')
+      expect(result.message).toContain('B_bob')
+    }
+  })
+
+  test('!agents reports none when no agents active', async () => {
+    const { dispatchAdminCommand } = await import('./admin.ts')
+    const result = await dispatchAdminCommand(
+      { kind: 'agents', ...envelope },
+      adminDeps({ getActiveAgents: () => [] }),
+    )
+    expect(result.kind).toBe('status')
+    if (result.kind === 'status') expect(result.message).toMatch(/No peer agents/i)
+  })
+})
+
 describe('ccsc-gyt — createPeerBotRateLimitStore', () => {
   test('first message from a (channel, bot) pair is allowed', async () => {
     const { createPeerBotRateLimitStore, DEFAULT_PEER_BOT_RATE_LIMIT } = await import(
@@ -12783,7 +17222,9 @@ describe('ccsc-gjm — MuteStore', () => {
     store.mute('C1', 'B1', 1_000_100, 'U', 1_000_000)
     store.mute('C2', 'B2', 1_000_200, 'U', 1_000_000)
     store.mute('C3', 'B3', 9_999_999_999, 'U', 1_000_000)
-    expect(store.prune(1_500_000)).toBe(2)
+    // prune now returns the removed entries (ccsc-yl6k9) so the reaper can
+    // notify on auto-expiry; two of the three are past their TTL.
+    expect(store.prune(1_500_000).length).toBe(2)
     expect(store.size()).toBe(1)
   })
 

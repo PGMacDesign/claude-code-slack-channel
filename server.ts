@@ -1,4 +1,5 @@
 #!/usr/bin/env bun
+import { randomUUID } from 'node:crypto'
 import {
   chmodSync,
   existsSync,
@@ -16,7 +17,7 @@ import { basename, join, resolve } from 'node:path'
  * Two-way Slack ↔ Claude Code bridge via Socket Mode + MCP stdio.
  * Security: gate layer, outbound gate, file exfiltration guard, prompt hardening.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
@@ -32,7 +33,10 @@ import {
   AUDIT_RECEIPTS_MAX,
   assertPublishAllowed,
   buildAndPostAuditReceipt,
+  buildSecretPlaceholderMap,
+  buildSecretValueSet,
   chunkText,
+  type DeliveryObligation,
   decidePermissionRoute,
   defaultAccess,
   detectNewAllowFrom,
@@ -44,11 +48,13 @@ import {
   isDuplicateEvent,
   isSlackFileUrl,
   LIST_SESSIONS_MAX,
+  assertNoSecretValues as libAssertNoSecretValues,
   assertOutboundAllowed as libAssertOutboundAllowed,
   assertSendable as libAssertSendable,
   deliveredThreadKey as libDeliveredThreadKey,
   gate as libGate,
   listSessions as libListSessions,
+  makeIdempotentSend,
   PERMISSION_REPLY_RE,
   type PendingPolicyApproval,
   parseSendableRoots,
@@ -56,6 +62,7 @@ import {
   permissionPairingKey as permKey,
   pruneExpired,
   recordApprovalVote,
+  redactSecretValues,
   resolveJournalPath,
   sanitizeDisplayName,
   sanitizeFilename,
@@ -73,7 +80,11 @@ import {
 } from './manifest.ts'
 import { createMuteStore } from './mute-store.ts'
 import { createMemoryNonceStore, mintNonce, verifyNonce } from './nonce-hitl.ts'
-import { createPeerBotRateLimitStore } from './peer-bot-rate-limit.ts'
+import {
+  createPeerBotRateLimitStore,
+  DEFAULT_CHANNEL_CIRCUIT_BREAKER,
+  DEFAULT_PEER_BOT_RATE_LIMIT,
+} from './peer-bot-rate-limit.ts'
 import {
   type ApprovalKey,
   approvalKey,
@@ -86,7 +97,19 @@ import {
   policyDigest,
   evaluate as policyEvaluate,
 } from './policy.ts'
-import { streamReply } from './stream-reply.ts'
+import {
+  beginDurableStream,
+  createDeliverySendDeps,
+  createFileSendDeps,
+  createReplyPoster,
+  type DurableStreamHandle,
+  DurableUnavailableError,
+  deliverChunkedReplyDurably,
+  deliverFileReplyDurably,
+  deliverReplyDurably,
+  sendFileObligation,
+} from './slack-delivery.ts'
+import { type StreamReplyResult, streamReply } from './stream-reply.ts'
 
 // ---------------------------------------------------------------------------
 // --verify-audit-log subcommand (ccsc-t7j, Epic 30-A.15)
@@ -125,7 +148,12 @@ if (_verifyPath !== null) {
   }
 }
 
-import { createSessionSupervisor, resolveIdleMs, type SessionSupervisor } from './supervisor.ts'
+import {
+  createSessionSupervisor,
+  resolveIdleMs,
+  resolveMaxConcurrentSessions,
+  type SessionSupervisor,
+} from './supervisor.ts'
 
 // Re-export constants so they stay in one place (lib.ts)
 export { MAX_PAIRING_REPLIES, MAX_PENDING, PAIRING_EXPIRY_MS } from './lib.ts'
@@ -163,7 +191,12 @@ try {
 mkdirSync(STATE_DIR, { recursive: true })
 mkdirSync(INBOX_DIR, { recursive: true })
 
-function loadEnv(): { botToken: string; appToken: string } {
+function loadEnv(): {
+  botToken: string
+  appToken: string
+  secretValues: Set<string>
+  secretPlaceholders: Map<string, string>
+} {
   if (!existsSync(ENV_FILE)) {
     console.error(
       `[slack] No .env found at ${ENV_FILE}\n` +
@@ -202,10 +235,22 @@ function loadEnv(): { botToken: string; appToken: string } {
     process.exit(1)
   }
 
-  return { botToken, appToken }
+  // ccsc-z0n.3 — build the live-secret-value set the outbound value-exfiltration
+  // guard blocks. Derived from the SECRET_DECLARATIONS table (ccsc-z0n.1) by
+  // resolving each declaration's env var against the parsed .env, so adding a
+  // secret means adding a table row and nothing here changes.
+  const secretValues = buildSecretValueSet((d) => vars[d.envVar])
+
+  // ccsc-z0n.2 — live-value → placeholder map for the inbound tool-result scrub.
+  // Same declaration-driven derivation; the agent sees a secret's stable
+  // placeholder if a live value ever surfaces in a result (defense-in-depth —
+  // the process boundary already keeps tokens out of agent-readable surfaces).
+  const secretPlaceholders = buildSecretPlaceholderMap((d) => vars[d.envVar])
+
+  return { botToken, appToken, secretValues, secretPlaceholders }
 }
 
-const { botToken, appToken } = loadEnv()
+const { botToken, appToken, secretValues, secretPlaceholders } = loadEnv()
 
 // ---------------------------------------------------------------------------
 // Slack clients
@@ -426,19 +471,15 @@ function processApprovalVote(
   entry.policy = vote.state
   if (vote.kind === 'approved') {
     grantPolicyApproval(vote.state, now)
-    journalWrite({
-      kind: 'policy.approved',
-      outcome: 'allow',
-      actor: 'human_approver',
-      sessionKey: vote.state.sessionKey,
-      toolName: entry.tool_name,
-      input: {
-        tool: entry.tool_name,
+    journalWrite(
+      buildPolicyApprovedEvent({
+        sessionKey: vote.state.sessionKey,
+        toolName: entry.tool_name,
+        ruleId: vote.state.ruleId,
         approversNeeded: vote.state.approversNeeded,
         approvers: Array.from(vote.state.approvedBy),
-      },
-      ruleId: vote.state.ruleId,
-    })
+      }),
+    )
     return { kind: 'approved', state: vote.state }
   }
   return { kind: 'pending', state: vote.state }
@@ -513,6 +554,13 @@ function assertSendable(filePath: string): void {
   libAssertSendable(filePath, resolve(INBOX_DIR), SENDABLE_ROOTS, STATE_DIR)
 }
 
+/** ccsc-z0n.3 — value-exfiltration guard bound to this process's live secret
+ *  values. Composes with assertSendable: that blocks secret *files* by path,
+ *  this blocks secret *values* by content (message text, file body). */
+function assertNoSecretValues(payload: string): void {
+  libAssertNoSecretValues(payload, secretValues)
+}
+
 // ---------------------------------------------------------------------------
 // Security — outbound gate
 // ---------------------------------------------------------------------------
@@ -522,6 +570,56 @@ function assertSendable(filePath: string): void {
 // Replaces the pre-xa3.6 channel-only set so the outbound gate can
 // enforce thread-level isolation per session-state-machine.md §207.
 const deliveredThreads = new Set<string>()
+
+// ccsc-apj.1 — threads a HUMAN has "engaged" by mentioning the bot at
+// least once. Keyed by the SESSION thread `deliveredThreadKey(channel,
+// thread_ts ?? ts)` (NOT raw thread_ts like deliveredThreads above), so a
+// top-level mention (ts=T1) and its in-thread follow-ups (thread_ts=T1)
+// share one slot. gate() consults this to let a human keep talking in an
+// engaged thread without re-mentioning on a requireMention channel. Peer
+// bots are never added here as sticky — the inbound gate refuses to make
+// ev.bot_id messages sticky regardless. Session-lifetime cache.
+const engagedThreads = new Set<string>()
+// Bound the engaged-thread cache so it can't grow without limit over a long
+// process lifetime (CodeRabbit, PR #244). At capacity the oldest entry is
+// evicted; a human in an evicted thread simply re-mentions to re-engage.
+const MAX_ENGAGED_THREADS = 10_000
+
+/** Record a thread as engaged for mention-stickiness, bounding the cache.
+ *  Sets iterate in insertion order, so the first key is the oldest; evict it
+ *  when at capacity (only when adding a genuinely new key). */
+function recordEngagedThread(key: string): void {
+  if (engagedThreads.size >= MAX_ENGAGED_THREADS && !engagedThreads.has(key)) {
+    const oldest = engagedThreads.values().next().value
+    if (oldest !== undefined) engagedThreads.delete(oldest)
+  }
+  engagedThreads.add(key)
+}
+
+/** Build the SessionKey for an inbound event. When the channel opts into
+ *  per-user session isolation (ccsc-kl410), the sender's userId is added so two
+ *  humans in one thread get separate sessions; otherwise the legacy shared
+ *  (channel, thread) key. Default-safe: no flag → shared, behavior unchanged. */
+function inboundSessionKey(
+  channelId: string,
+  threadKey: string,
+  access: Access,
+  ev: Record<string, unknown>,
+): import('./lib.ts').SessionKey {
+  // Sender identity: the human user_id, or the bot's id for a peer bot. Validate
+  // it is a NON-EMPTY string before keying (ev fields are `unknown`); an
+  // empty/absent sender falls back to the shared session rather than building an
+  // invalid empty-userId key (Gemini, PR #248).
+  const senderId = (ev.user ?? ev.bot_id) as unknown
+  if (
+    access.channels[channelId]?.perUserSessions === true &&
+    typeof senderId === 'string' &&
+    senderId !== ''
+  ) {
+    return { channel: channelId, thread: threadKey, userId: senderId }
+  }
+  return { channel: channelId, thread: threadKey }
+}
 
 // Dedupe events across `message` and `app_mention` subscriptions. Keyed on
 // (channel, ts). See isDuplicateEvent in lib.ts for rationale.
@@ -554,6 +652,12 @@ let supervisor: SessionSupervisor | null = null
 /** Interval handle for the idle reaper tick. Stored so it can be cleared
  *  before supervisor.shutdown() during graceful exit. */
 let reaperTimer: ReturnType<typeof setInterval> | null = null
+
+/** Interval handle for the outbox delivery poller tick (ccsc-o7x.3). Drains
+ *  pending reply-delivery obligations (replies a crash or a transient Slack
+ *  failure left undelivered) with idempotent retry. Stored so it can be cleared
+ *  before supervisor.shutdown() during graceful exit, exactly like reaperTimer. */
+let deliveryTimer: ReturnType<typeof setInterval> | null = null
 
 // Track last active channel/thread for permission relay
 let lastActiveChannel = ''
@@ -593,15 +697,23 @@ function journalWrite(
 // resolve. Mirrors the acp-adapter.ts pattern (PR #173).
 import {
   buildDenyNotificationParams,
+  buildPolicyAllowEvent,
+  buildPolicyApprovedEvent,
+  buildPolicyRequireEvent,
   type DenyNotificationParams,
   type PolicyDenyDetail,
+  permissionRouteJournalEvents,
   recordPolicyDenyToJournal,
 } from './policy-dispatch.ts'
 
 export {
   buildDenyNotificationParams,
+  buildPolicyAllowEvent,
+  buildPolicyApprovedEvent,
+  buildPolicyRequireEvent,
   type DenyNotificationParams,
   type PolicyDenyDetail,
+  permissionRouteJournalEvents,
   recordPolicyDenyToJournal,
 }
 
@@ -626,6 +738,9 @@ async function gate(event: unknown): Promise<GateResult> {
     // bounded under sustained load.
     muteStore: adminMuteStore,
     peerBotRateLimitStore: peerBotRateLimitStore,
+    // ccsc-apj.1 — engaged-thread set so a human can keep talking in a
+    // thread they already mentioned the bot in, without re-mentioning.
+    engagedThreads,
   })
 }
 
@@ -883,7 +998,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'list_sessions',
       description:
-        'List active per-thread sessions on this host: (channel, thread, ownerId, createdAt, lastActiveAt). Does NOT return session body/conversation state — operators get a thread inventory only.',
+        'List active per-thread sessions on this host: (channel, thread, ownerId, createdAt, lastActiveAt). Does NOT return session body/conversation state — operators get a thread inventory only. (Companion tool: for governance across multiple agent runtimes beyond this Slack bridge, see agent-governance-plane (AGP), which builds on this substrate.)',
       inputSchema: {
         type: 'object' as const,
         properties: {},
@@ -945,6 +1060,7 @@ interface ToolContext {
   botToken: string
   assertOutboundAllowed: (chatId: string, threadTs: string | undefined) => void
   assertSendable: (filePath: string) => void
+  assertNoSecretValues: (payload: string) => void
   journalWrite: (input: Parameters<import('./journal.ts').JournalWriter['writeEvent']>[0]) => void
   getAccess: () => import('./lib.ts').Access
   resolveUserName: (userId: string) => Promise<string>
@@ -963,6 +1079,25 @@ type ToolResult = { content: Array<{ type: string; text: string }>; isError?: bo
 // ---------------------------------------------------------------------------
 // Per-tool handler functions
 // ---------------------------------------------------------------------------
+
+/** ccsc-z0n.3 — run the value-exfiltration guard over an outbound payload,
+ *  journaling an `exfil.block` (reason names the value-guard, NEVER the value
+ *  or the payload) and rethrowing on a hit. Mirrors the assertSendable block
+ *  path in executeReplyFileUploads so text leaks and file-path leaks land in
+ *  the journal the same way. */
+function guardOutboundSecretValues(payload: string, toolName: string, ctx: ToolContext): void {
+  try {
+    ctx.assertNoSecretValues(payload)
+  } catch (secretErr) {
+    ctx.journalWrite({
+      kind: 'exfil.block',
+      outcome: 'deny',
+      toolName,
+      reason: secretErr instanceof Error ? secretErr.message : String(secretErr),
+    })
+    throw secretErr
+  }
+}
 
 // -----------------------------------------------------------------------
 // reply
@@ -995,6 +1130,20 @@ async function executeReplyFileUploads(
       throw exfilErr
     }
     const resolved = resolve(filePath)
+    // ccsc-z0n.3 — value-exfiltration guard on file *content*: assertSendable
+    // blocked secret files by path; this blocks a live secret value embedded in
+    // an otherwise-allowlisted file's body. Read as latin1 so every byte maps
+    // 1:1 to a character (a token is ASCII; no decode can split or drop it).
+    // The filename is checked too — an attacker who can't put the token in the
+    // body might smuggle it as the name.
+    let body: string
+    try {
+      body = readFileSync(resolved, 'latin1')
+    } catch {
+      body = '' // unreadable here → filesUploadV2 surfaces the real error
+    }
+    guardOutboundSecretValues(body, 'reply', ctx)
+    guardOutboundSecretValues(basename(resolved), 'reply', ctx)
     const uploadArgs: Record<string, any> = {
       channel_id: chatId,
       file: resolved,
@@ -1005,13 +1154,85 @@ async function executeReplyFileUploads(
   }
 }
 
+/** ccsc-o7x.6 — record a stream-finalize obligation (full text) if the session
+ *  can go durable, else `null` (best-effort — stream without a net, the prior
+ *  behavior). Module-level so `executeReplyStreamingPath` stays under CRAP-30.
+ *
+ *  The obligation here is a crash safety-net that is SEPARATE from the send (the
+ *  send is the stream itself), unlike the text/chunked durable paths where the
+ *  obligation IS the send. So ANY failure to set it up — `DurableUnavailableError`
+ *  (no session/lease) OR a `recordTerminalDelivery` write failure (disk, fence) —
+ *  degrades to best-effort streaming rather than failing the reply. This keeps
+ *  o7x.6 durability strictly additive: it can never make streaming worse than the
+ *  pre-o7x.6 behavior. A non-`DurableUnavailableError` failure is logged to
+ *  stderr (it signals a real storage problem) but never propagated. */
+async function maybeBeginDurableStream(
+  chatId: string,
+  threadTs: string | undefined,
+  text: string,
+): Promise<DurableStreamHandle | null> {
+  if (supervisor === null || threadTs === undefined) return null
+  try {
+    return await beginDurableStream(
+      { supervisor },
+      { id: randomUUID(), channel: chatId, thread: threadTs, text },
+    )
+  } catch (err) {
+    if (!(err instanceof DurableUnavailableError)) {
+      console.error('[slack] beginDurableStream failed; streaming best-effort', {
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+    return null
+  }
+}
+
+/** ccsc-o7x.6 — resolve the stream-finalize obligation from the `streamReply`
+ *  outcome: `completed` → `delivered`; any clean in-process failure
+ *  (`failed_mid_stream` or `gate_rejected_at_start`) → `dead` (the partial
+ *  message that landed is the same best-effort outcome as before; the poller does
+ *  NOT re-run the outbound gate, so a gate-rejected stream must never be
+ *  auto-redelivered). A process crash never reaches here, leaving the obligation
+ *  `pending` for the poller to redeliver. No-op when there is no durable handle. */
+async function resolveStreamObligation(
+  durable: DurableStreamHandle | null,
+  result: StreamReplyResult,
+): Promise<void> {
+  if (durable === null) return
+  switch (result.kind) {
+    case 'completed':
+      await durable.markDelivered()
+      return
+    case 'failed_mid_stream':
+      await durable.markDead(`failed mid-stream: ${result.reason}`)
+      return
+    case 'gate_rejected_at_start':
+      await durable.markDead(`stream rejected at start: ${result.reason}`)
+      return
+    default: {
+      // Exhaustiveness guard: a new StreamReplyResult variant must declare its
+      // obligation resolution here, failing to compile rather than silently
+      // dead-lettering with a misleading reason (matches the
+      // permissionRouteJournalEvents never-guard, ccsc-175).
+      const _exhaustive: never = result
+      return _exhaustive
+    }
+  }
+}
+
 /** ccsc-h1h — extracted streaming path for executeReply. Posts the
  *  reply via streamReply (single message that grows via chat.update)
  *  + handles the file-upload tail + builds the result. streamReply
  *  emits its own gate.outbound.allow + system.stream_finalize events
  *  so this path does NOT write a separate allow event. Kept as a
  *  module-level function so executeReply itself stays under the
- *  CRAP-30 threshold. */
+ *  CRAP-30 threshold.
+ *
+ *  ccsc-o7x.6 — wraps the stream in a stream-finalize obligation so a process
+ *  crash mid-stream redelivers the full text as a fresh message (ADR-002
+ *  addendum). The obligation is recorded BEFORE streaming and resolved after:
+ *  delivered on completion, dead on any in-process failure, left pending only by
+ *  an actual crash. */
 async function executeReplyStreamingPath(opts: {
   chatId: string
   threadTs: string | undefined
@@ -1021,40 +1242,60 @@ async function executeReplyStreamingPath(opts: {
   ctx: ToolContext
 }): Promise<ToolResult> {
   const { chatId, threadTs, text, files, limit, ctx } = opts
-  const result = await streamReply(
-    { channel: chatId, threadTs, text, chunkSize: limit },
-    {
-      assertOutboundAllowed: (c, t) => ctx.assertOutboundAllowed(c, t),
-      postMessage: async (a) => {
-        const res = await ctx.web.chat.postMessage({
-          channel: a.channel,
-          text: a.text,
-          thread_ts: a.thread_ts,
-          unfurl_links: false,
-          unfurl_media: false,
-        })
-        const ts = res.ts as string | undefined
-        // Per Gemini review on PR #188: validate ts BEFORE returning
-        // an empty string downstream. streamReply's invariant is that
-        // subsequent chat.update calls target a real ts; an empty
-        // string would cause each update to fail with a confusing
-        // "channel_not_found"-style Slack error. Throw here so
-        // streamReply's init-failure path runs cleanly + the
-        // system.stream_finalize event records the failure reason.
-        if (!ts) throw new Error('chat.postMessage returned no ts')
-        return { ts }
+
+  const durable = await maybeBeginDurableStream(chatId, threadTs, text)
+
+  let result: StreamReplyResult
+  try {
+    result = await streamReply(
+      { channel: chatId, threadTs, text, chunkSize: limit },
+      {
+        assertOutboundAllowed: (c, t) => ctx.assertOutboundAllowed(c, t),
+        postMessage: async (a) => {
+          const res = await ctx.web.chat.postMessage({
+            channel: a.channel,
+            text: a.text,
+            thread_ts: a.thread_ts,
+            unfurl_links: false,
+            unfurl_media: false,
+          })
+          const ts = res.ts as string | undefined
+          // Per Gemini review on PR #188: validate ts BEFORE returning
+          // an empty string downstream. streamReply's invariant is that
+          // subsequent chat.update calls target a real ts; an empty
+          // string would cause each update to fail with a confusing
+          // "channel_not_found"-style Slack error. Throw here so
+          // streamReply's init-failure path runs cleanly + the
+          // system.stream_finalize event records the failure reason.
+          if (!ts) throw new Error('chat.postMessage returned no ts')
+          return { ts }
+        },
+        updateMessage: async (a) => {
+          await ctx.web.chat.update({ channel: a.channel, ts: a.ts, text: a.text })
+        },
+        // Per Gemini review on PR #188: inject toolName so streamReply's
+        // gate.outbound.allow + system.stream_finalize events attribute
+        // to 'reply' in the audit log (streamReply is a generic
+        // primitive; it doesn't know the calling tool's name).
+        journalWrite: async (input) => ctx.journalWrite({ ...input, toolName: 'reply' }),
+        sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
       },
-      updateMessage: async (a) => {
-        await ctx.web.chat.update({ channel: a.channel, ts: a.ts, text: a.text })
-      },
-      // Per Gemini review on PR #188: inject toolName so streamReply's
-      // gate.outbound.allow + system.stream_finalize events attribute
-      // to 'reply' in the audit log (streamReply is a generic
-      // primitive; it doesn't know the calling tool's name).
-      journalWrite: async (input) => ctx.journalWrite({ ...input, toolName: 'reply' }),
-      sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
-    },
-  )
+    )
+  } catch (streamErr) {
+    // streamReply re-throws on init failure (the journal-allow write or the
+    // initial postMessage threw before any chunk landed). Resolve the obligation
+    // terminal — best-effort, NOT auto-redelivered — then re-throw so the agent
+    // sees the real failure, exactly as before. Leaving it pending would risk a
+    // double-send (the agent may retry AND the poller would redeliver).
+    await durable?.markDead(streamErr instanceof Error ? streamErr.message : String(streamErr))
+    throw streamErr
+  }
+
+  // Resolve the stream-finalize obligation before any throw, so a
+  // gate_rejected_at_start marks dead (never auto-redelivered) rather than
+  // staying pending.
+  await resolveStreamObligation(durable, result)
+
   if (result.kind === 'gate_rejected_at_start') {
     // Unreachable in practice — assertOutboundAllowed already passed
     // in executeReply — but documented as the structured outcome.
@@ -1072,6 +1313,160 @@ async function executeReplyStreamingPath(opts: {
       {
         type: 'text',
         text: `Streamed ${chunksSent} chunk(s)${files?.length ? ` + ${files.length} file(s)` : ''} to ${chatId}${lastTs ? ` [ts: ${lastTs}]` : ''}${failureSuffix}`,
+      },
+    ],
+  }
+}
+
+/** ccsc-o7x.3 — durable single-message reply path. Records a durable obligation
+ *  before the send and lets the background poller redeliver on a transient
+ *  failure or a crash (ADR-002 addendum, Option A). The caller (`executeReply`)
+ *  has already journaled `gate.outbound.allow` and gated this to the single-
+ *  message case (no stream/files, fits one chunk, has a thread). Throws
+ *  `DurableUnavailableError` (before any record/send) when the session can't go
+ *  durable — the caller then falls back to the direct send. A non-retryable
+ *  Slack error propagates (the obligation is marked dead inside
+ *  `deliverReplyDurably`). Extracted to keep `executeReply`'s CRAP score down. */
+async function executeReplyDurablePath(opts: {
+  chatId: string
+  threadTs: string
+  text: string
+  ctx: ToolContext
+}): Promise<ToolResult> {
+  const { chatId, threadTs, text, ctx } = opts
+  if (supervisor === null) throw new DurableUnavailableError('supervisor not started')
+
+  const result = await deliverReplyDurably(
+    { supervisor, post: createReplyPoster(ctx.web) },
+    { id: randomUUID(), channel: chatId, thread: threadTs, text },
+  )
+
+  if (result.status === 'delivered') {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Sent 1 message to ${chatId}${result.ts ? ` [ts: ${result.ts}]` : ''}`,
+        },
+      ],
+    }
+  }
+  return {
+    content: [
+      {
+        type: 'text',
+        text: `Queued for delivery to ${chatId} (transient Slack error; the delivery poller will retry until it lands)`,
+      },
+    ],
+  }
+}
+
+/** ccsc-o7x.4 — durable path for a chunked (multi-message) reply: the N>1 sibling
+ *  of `executeReplyDurablePath`. Records all chunk obligations up front and
+ *  delivers them in order via `deliverChunkedReplyDurably`; a transient failure
+ *  mid-stream queues the tail for the poller (which redelivers in order) rather
+ *  than losing it. Throws `DurableUnavailableError` (before any record/send) when
+ *  the session can't go durable — the caller falls back to the direct chunk loop.
+ *  Extracted to keep `executeReply`'s CRAP score down. */
+async function executeReplyChunkedDurablePath(opts: {
+  chatId: string
+  threadTs: string
+  chunks: string[]
+  ctx: ToolContext
+}): Promise<ToolResult> {
+  const { chatId, threadTs, chunks, ctx } = opts
+  if (supervisor === null) throw new DurableUnavailableError('supervisor not started')
+
+  const result = await deliverChunkedReplyDurably(
+    { supervisor, post: createReplyPoster(ctx.web) },
+    { id: randomUUID(), channel: chatId, thread: threadTs, chunks },
+  )
+
+  if (result.status === 'delivered') {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Sent ${result.sent} message(s) to ${chatId}${result.ts ? ` [ts: ${result.ts}]` : ''}`,
+        },
+      ],
+    }
+  }
+  // Queued: a prefix delivered; the rest is owed to the poller (redelivered in
+  // order). The caller must NOT retry — that would double-post the sent prefix.
+  const total = result.delivered + result.pending
+  return {
+    content: [
+      {
+        type: 'text',
+        text: `Sent ${result.delivered} of ${total} message(s) to ${chatId}; ${result.pending} queued for delivery (transient Slack error; the poller retries the rest in order)`,
+      },
+    ],
+  }
+}
+
+/** ccsc-o7x.5 — durable path for a reply WITH file attachments. Records the text
+ *  chunks + one obligation per file and delivers them in order via
+ *  `deliverFileReplyDurably`; each file uploads through `createFileSendDeps`,
+ *  which re-runs the outbound exfil guard on the file's bytes before every
+ *  (re)upload and dedups by `(filename, size)` thread scan. A transient failure
+ *  queues the tail for the poller; an `ExfilBlockedError` (a file failed the
+ *  guard) marks that file dead and propagates to the agent — exactly as the
+ *  best-effort path surfaced a block. Throws `DurableUnavailableError` (before any
+ *  record/send) when the session can't go durable — the caller falls back to the
+ *  best-effort direct path. Extracted to keep `executeReply`'s CRAP score down. */
+async function executeReplyFileDurablePath(opts: {
+  chatId: string
+  threadTs: string
+  chunks: string[]
+  files: string[]
+  ctx: ToolContext
+}): Promise<ToolResult> {
+  const { chatId, threadTs, chunks, files, ctx } = opts
+  if (supervisor === null) throw new DurableUnavailableError('supervisor not started')
+
+  const fileDeps = createFileSendDeps({
+    client: ctx.web,
+    assertSendable: ctx.assertSendable,
+    assertNoSecretValues: ctx.assertNoSecretValues,
+    journalExfilBlock: (reason) =>
+      ctx.journalWrite({ kind: 'exfil.block', outcome: 'deny', toolName: 'reply', reason }),
+    readFile: (p) => readFileSync(resolve(p)),
+    fileSize: (p) => statSync(resolve(p)).size,
+  })
+
+  // Drop empty chunks so a files-only reply (empty text) uploads files without an
+  // empty Slack message; each path resolves to a basename for the upload filename.
+  const textChunks = chunks.filter((c) => c.length > 0)
+  const fileDescriptors = files.map((p) => ({ path: p, filename: basename(resolve(p)) }))
+
+  const result = await deliverFileReplyDurably(
+    { supervisor, post: createReplyPoster(ctx.web), files: fileDeps },
+    {
+      id: randomUUID(),
+      channel: chatId,
+      thread: threadTs,
+      chunks: textChunks,
+      files: fileDescriptors,
+    },
+  )
+
+  if (result.status === 'delivered') {
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `Sent ${result.messagesSent} message(s) + ${result.filesSent} file(s) to ${chatId}${result.ts ? ` [ts: ${result.ts}]` : ''}`,
+        },
+      ],
+    }
+  }
+  const total = result.delivered + result.pending
+  return {
+    content: [
+      {
+        type: 'text',
+        text: `Sent ${result.delivered} of ${total} item(s) to ${chatId}; ${result.pending} queued for delivery (transient Slack error; the poller retries the rest in order)`,
       },
     ],
   }
@@ -1098,6 +1493,11 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
     throw outboundErr
   }
 
+  // ccsc-z0n.3 — value-exfiltration guard on the reply text. Runs BEFORE the
+  // streaming/non-streaming branch (so both paths are covered) and before the
+  // gate.outbound.allow event (a blocked send was never allowed).
+  guardOutboundSecretValues(text, 'reply', ctx)
+
   const access = ctx.getAccess()
   const limit = access.textChunkLimit || ctx.DEFAULT_CHUNK_LIMIT
   const mode = access.chunkMode || 'newline'
@@ -1108,7 +1508,8 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
     return executeReplyStreamingPath({ chatId, threadTs, text, files, limit, ctx })
   }
 
-  // Non-streaming path — existing behavior unchanged.
+  // Non-streaming path. The gate.outbound.allow is journaled once here and
+  // shared by both the durable and the direct sub-paths below.
   ctx.journalWrite({
     kind: 'gate.outbound.allow',
     outcome: 'allow',
@@ -1117,7 +1518,34 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
     input: { channel: chatId, thread_ts: threadTs },
   })
 
+  // ccsc-o7x.3/.4/.5 — durable reply path (ADR-002 addendum, Option A). Applies to
+  // any non-streaming reply in a thread while the supervisor is up: the reply is
+  // recorded as durable obligation(s) so a transient Slack failure or a crash is
+  // retried by the delivery poller instead of lost. One text chunk → the
+  // single-message path (ccsc-o7x.3); N chunks → the chunked path (ccsc-o7x.4);
+  // a reply WITH files → the file path (ccsc-o7x.5), which records the text chunks
+  // + one obligation per file and uploads each with the exfil guard re-run on the
+  // bytes. Falls back to the best-effort direct send below if the session can't go
+  // durable (DurableUnavailableError). Streaming replies are handled above
+  // (ccsc-o7x.6). An ExfilBlockedError from the file path propagates to the agent
+  // (a blocked file surfaces, exactly as the best-effort path did).
   const chunks = chunkText(text, limit, mode)
+  const hasFiles = files !== undefined && files.length > 0
+
+  if (!stream && threadTs !== undefined && supervisor !== null) {
+    try {
+      if (hasFiles) {
+        return await executeReplyFileDurablePath({ chatId, threadTs, chunks, files, ctx })
+      }
+      return chunks.length <= 1
+        ? await executeReplyDurablePath({ chatId, threadTs, text, ctx })
+        : await executeReplyChunkedDurablePath({ chatId, threadTs, chunks, ctx })
+    } catch (durableErr) {
+      if (!(durableErr instanceof DurableUnavailableError)) throw durableErr
+      // Session couldn't go durable — fall through to the best-effort direct
+      // send (the allow event above already stands).
+    }
+  }
 
   let lastTs = ''
   for (const chunk of chunks) {
@@ -1215,6 +1643,9 @@ async function executeEditMessage(
     })
     throw outboundErr
   }
+  // ccsc-z0n.3 — value-exfiltration guard on the edited text, before the
+  // gate.outbound.allow event (a blocked edit was never allowed).
+  guardOutboundSecretValues(args.text, 'edit_message', ctx)
   ctx.journalWrite({
     kind: 'gate.outbound.allow',
     outcome: 'allow',
@@ -1757,6 +2188,33 @@ const toolHandlers: Record<string, ToolHandler> = {
   publish_manifest: executePublishManifest,
 }
 
+/** ccsc-z0n.2 — inbound (tool-result → agent) defense-in-depth scrub. Every
+ *  tool result flows back to the Claude process through here; if a declared
+ *  secret value ever surfaces in one (it cannot today — tokens live only in
+ *  this bridge process and never enter a result — but a future tool/refactor
+ *  could regress), swap it for its placeholder BEFORE the agent reads it and
+ *  journal the near-miss. The scrub touches only `content[].text`; the reason
+ *  names the tool and the count, NEVER the value. Returns the result unchanged
+ *  in the common (clean) case. */
+function scrubToolResult(result: ToolResult, toolName: string): ToolResult {
+  if (secretPlaceholders.size === 0 || !Array.isArray(result.content)) return result
+  let totalRedacted = 0
+  const content = result.content.map((part) => {
+    if (part?.type !== 'text' || typeof part.text !== 'string') return part
+    const { text, redactedCount } = redactSecretValues(part.text, secretPlaceholders)
+    totalRedacted += redactedCount
+    return redactedCount > 0 ? { ...part, text } : part
+  })
+  if (totalRedacted === 0) return result
+  journalWrite({
+    kind: 'exfil.block',
+    outcome: 'deny',
+    toolName,
+    reason: `scrubbed ${totalRedacted} declared secret value(s) from tool result before returning to agent`,
+  })
+  return { ...result, content }
+}
+
 mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name } = request.params
   let args = (request.params.arguments || {}) as Record<string, any>
@@ -1798,6 +2256,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       botToken,
       assertOutboundAllowed,
       assertSendable,
+      assertNoSecretValues,
       journalWrite,
       getAccess,
       resolveUserName,
@@ -1809,7 +2268,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
       INBOX_DIR,
       DEFAULT_CHUNK_LIMIT,
     }
-    return handler(args, ctx)
+    // ccsc-z0n.2 — scrub the result of any declared secret value before it
+    // crosses back to the agent (defense-in-depth; see scrubToolResult).
+    return scrubToolResult(await handler(args, ctx), name)
   }
   return {
     content: [{ type: 'text', text: `Unknown tool: ${name}` }],
@@ -1971,16 +2432,17 @@ mcp.setNotificationHandler(
         lastActiveThread,
         params.tool_name,
       )
-      journalWrite({
-        kind: 'policy.allow',
-        outcome: 'allow',
-        actor: 'claude_process',
+      // Build + write via the exhaustive route→events contract so the
+      // no-gaps invariant (ccsc-1iw.2) binds this production path, not a
+      // test-local map (ccsc-175). auto_allow → exactly [policy.allow].
+      for (const ev of permissionRouteJournalEvents(route, {
         sessionKey: policySessionKey,
         toolName: params.tool_name,
         input: policyInput,
-        ruleId: route.ruleId,
         correlationId,
-      })
+      })) {
+        journalWrite(ev)
+      }
       await mcp.notification({
         method: 'notifications/claude/channel/permission',
         params: { request_id: params.request_id, behavior: 'allow' },
@@ -2063,15 +2525,17 @@ mcp.setNotificationHandler(
     // for the no-opinion case — see release-plan R2).
     let pendingPolicy: PendingPolicyApproval | undefined
     if (route.type === 'require_human' && decision.kind === 'require') {
-      journalWrite({
-        kind: 'policy.require',
-        outcome: 'require',
-        actor: 'claude_process',
+      // Same exhaustive contract as auto_allow above (ccsc-175):
+      // require_human → exactly [policy.require], approversNeeded merged
+      // into the trace input by the builder.
+      for (const ev of permissionRouteJournalEvents(route, {
         sessionKey: policySessionKey,
         toolName: params.tool_name,
-        input: { ...policyInput, approversNeeded: decision.approvers },
-        ruleId: route.ruleId,
-      })
+        input: policyInput,
+        approversNeeded: decision.approvers,
+      })) {
+        journalWrite(ev)
+      }
       pendingPolicy = {
         ruleId: decision.rule,
         ttlMs: decision.ttlMs,
@@ -2517,11 +2981,26 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
   const incomingThreadTs = ev.thread_ts as string | undefined
   deliveredThreads.add(libDeliveredThreadKey(channelId, incomingThreadTs))
 
+  // ccsc-apj.1 — mark this thread engaged for mention-stickiness, but ONLY
+  // for human deliveries. A human mentioning the bot opens the thread for
+  // mention-free human follow-ups; a peer bot must keep mentioning, so a
+  // bot-only thread never becomes sticky. Keyed by the session thread
+  // (thread_ts ?? ts) so a top-level mention and its in-thread replies match.
+  if (!ev.bot_id) {
+    recordEngagedThread(libDeliveredThreadKey(channelId, incomingThreadTs ?? (ev.ts as string)))
+  }
+
+  // ccsc-kl410 — per-user session isolation (helper keeps deliverEvent under the
+  // CRAP gate). Built once and used for both the journal record (so the chosen
+  // key shape is auditable) and the supervisor activation below.
+  const threadKey = incomingThreadTs ?? (ev.ts as string)
+  const sessionKey = inboundSessionKey(channelId, threadKey, access, ev)
+
   journalWrite({
     kind: 'gate.inbound.deliver',
     outcome: 'allow',
     actor: ev.bot_id ? 'peer_agent' : 'session_owner',
-    sessionKey: { channel: channelId, thread: incomingThreadTs ?? (ev.ts as string) },
+    sessionKey,
     input: {
       channel: channelId,
       user: ev.bot_id ? (ev.bot_id as string) : (ev.user as string | undefined),
@@ -2539,11 +3018,7 @@ async function deliverEvent(ev: Record<string, unknown>, access: Access): Promis
   // and DROP — do not propagate so the event loop stays alive for
   // other sessions. Same policy for handle.update() failures.
   if (supervisor !== null) {
-    await activateAndTouch(
-      supervisor,
-      { channel: channelId, thread: incomingThreadTs ?? (ev.ts as string) },
-      ev.user as string | undefined,
-    )
+    await activateAndTouch(supervisor, sessionKey, ev.user as string | undefined)
   }
 
   // Track last active channel for permission relay
@@ -2907,6 +3382,18 @@ async function tryDispatchAdminVerb(ev: Record<string, unknown>, access: Access)
       }
     },
     muteStore: adminMuteStore,
+    // ccsc-yl6k9 — effective rate-limit view for the read-only !rate-limit verb.
+    getChannelRateLimits: (chId: string) => {
+      const chPolicy = getAccess().channels?.[chId]
+      return {
+        peerBot: chPolicy?.peerBotRateLimit ?? DEFAULT_PEER_BOT_RATE_LIMIT,
+        channel: chPolicy?.channelCircuitBreaker ?? DEFAULT_CHANNEL_CIRCUIT_BREAKER,
+      }
+    },
+    // ccsc-4e9bf — "agents online": peer bots active in the last 5 min, derived
+    // from the rate-limit store's per-channel activity.
+    getActiveAgents: (chId: string, now: number) =>
+      peerBotRateLimitStore.activeBots(chId, now, 5 * 60_000),
   }
 
   try {
@@ -2915,6 +3402,19 @@ async function tryDispatchAdminVerb(ev: Record<string, unknown>, access: Access)
       // No emoji reaction at challenge phase — the DM IS the visible
       // feedback that something happened. Reaction lands when the
       // operator redeems.
+    } else if (outcome.kind === 'status') {
+      // ccsc-yl6k9 — post the read-only status message back into the thread.
+      try {
+        await web.chat.postMessage({
+          channel: channelId,
+          thread_ts: threadTs,
+          text: outcome.message,
+          unfurl_links: false,
+          unfurl_media: false,
+        })
+      } catch (err) {
+        console.error('[slack] admin status post failed:', err)
+      }
     }
     return true
   } catch (err) {
@@ -2996,6 +3496,15 @@ async function shutdown(reason: string, code = 0): Promise<void> {
   if (reaperTimer !== null) {
     clearInterval(reaperTimer)
     reaperTimer = null
+  }
+
+  // Stop the outbox delivery poller too, for the same reason (ccsc-o7x.3): a
+  // drainOutbox tick must not race the supervisor's quiesce-all pass. Any
+  // obligations still pending are durable on disk and the next process boot
+  // drains them.
+  if (deliveryTimer !== null) {
+    clearInterval(deliveryTimer)
+    deliveryTimer = null
   }
 
   // Drain in-flight session writes before exiting. This ensures that any
@@ -3179,6 +3688,9 @@ async function main(): Promise<void> {
     stateRoot: STATE_DIR,
     idleMs: resolveIdleMs(process.env),
     journal: journal ?? undefined,
+    // ccsc-4e9bf — optional global backpressure cap (SLACK_MAX_CONCURRENT_SESSIONS).
+    // Unset → unlimited (default).
+    maxConcurrentSessions: resolveMaxConcurrentSessions(process.env),
   })
 
   // Idle reaper: one pass every 60 s, finds sessions whose lastActiveAt is
@@ -3191,7 +3703,18 @@ async function main(): Promise<void> {
   reaperTimer = setInterval(() => {
     void supervisor!.reapIdle()
     const now = Date.now()
-    adminMuteStore.prune(now)
+    for (const expired of adminMuteStore.prune(now)) {
+      // ccsc-yl6k9 — notify the channel when a mute auto-expires so a bot
+      // un-muting is never a silent surprise. Best-effort; never blocks the reaper.
+      void web.chat
+        .postMessage({
+          channel: expired.channelId,
+          text: `:loud_sound: <@${expired.botId}> un-muted (mute expired).`,
+          unfurl_links: false,
+          unfurl_media: false,
+        })
+        .catch((err) => console.error('[slack] mute-expiry notice failed:', err))
+    }
     // The reaper's job is "drop entries that NO conceivable window
     // would still consider live" — NOT to match the default window.
     // Per Gemini high-priority fix on PR #187: a hardcoded 60s
@@ -3213,6 +3736,53 @@ async function main(): Promise<void> {
   // Don't hold the event loop open on the reaper tick alone — the socket and
   // MCP transport already keep the process alive while active.
   if (typeof reaperTimer.unref === 'function') reaperTimer.unref()
+
+  // Outbox delivery poller (ccsc-o7x.3): drain pending reply-delivery
+  // obligations — replies a crash or a transient Slack failure left
+  // undelivered — with idempotent retry / dead-letter. The boot-time drain
+  // recovers obligations the previous process left pending (crash recovery for
+  // replies); the interval is the steady-state retry. Mirrors reaperTimer:
+  // unref'd, and cleared on shutdown before the supervisor drain. The send is
+  // idempotent (lib.ts `makeIdempotentSend` over the Slack adapter), so a
+  // redelivery after a lost ack never double-posts.
+  const idempotentSend = makeIdempotentSend(createDeliverySendDeps(web))
+  // ccsc-o7x.5 — file obligations upload via filesUploadV2 with the outbound exfil
+  // guard re-run on the bytes (a file's content can change between record and
+  // redelivery); text obligations post via the idempotent text send. The guard
+  // uses the same module-level assertSendable / assertNoSecretValues the reply
+  // tool uses, and journals exfil.block on a block.
+  const fileSendDeps = createFileSendDeps({
+    client: web,
+    assertSendable,
+    assertNoSecretValues,
+    journalExfilBlock: (reason) =>
+      journalWrite({ kind: 'exfil.block', outcome: 'deny', toolName: 'reply', reason }),
+    readFile: (p) => readFileSync(resolve(p)),
+    fileSize: (p) => statSync(resolve(p)).size,
+  })
+  const outboxSend = (ob: DeliveryObligation): Promise<void> =>
+    ob.upload !== undefined
+      ? sendFileObligation(fileSendDeps, ob).then(() => undefined)
+      : idempotentSend(ob)
+  const drainOutboxOnce = (): void => {
+    void supervisor!
+      .drainOutbox(outboxSend)
+      .then((report) => {
+        if (report.deadLettered.length > 0) {
+          console.error('[slack] outbox: dead-lettered obligations', report.deadLettered)
+        }
+      })
+      .catch((err) => {
+        console.error('[slack] outbox drain failed:', err instanceof Error ? err.message : err)
+      })
+  }
+  const deliveryPollMs = (() => {
+    const raw = Number(process.env.SLACK_DELIVERY_POLL_MS)
+    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 15_000
+  })()
+  drainOutboxOnce() // boot-time recovery of crash-pending obligations
+  deliveryTimer = setInterval(drainOutboxOnce, deliveryPollMs)
+  if (typeof deliveryTimer.unref === 'function') deliveryTimer.unref()
 
   // Resolve bot identity (user ID, bot ID, app ID) for mention detection
   // and self-echo filtering across payload variants and multi-workspace setups

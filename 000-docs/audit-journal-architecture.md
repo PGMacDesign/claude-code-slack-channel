@@ -50,6 +50,7 @@ type EventKind =
   | 'session.quiesce'
   | 'session.deactivate'
   | 'session.quarantine'
+  | 'session.activate_rejected'  // ccsc-4e9bf — refused a new session at the maxConcurrentSessions cap
   | 'pairing.issued'
   | 'pairing.accepted'
   | 'pairing.expired'
@@ -271,6 +272,96 @@ Why separate the projection?
    into the writer.
 3. **The projection can be disabled** without losing anything; the
    journal is primary.
+
+### The reply-delivery outbox is NOT the audit projection (ccsc-o7x.2.1)
+
+The crash-safety epic (`ccsc-o7x`) adds a **reply-delivery outbox** — a durable
+"reply owed" record (`DeliveryObligation`) written when a turn reaches its
+terminal state, so a failed `chat.postMessage` is retried instead of swallowed.
+It is easy to confuse with the audit projection (both touch Slack), so the
+boundary is stated explicitly:
+
+| | **Audit projection** (30-B) | **Reply-delivery outbox** (`ccsc-o7x.2`) |
+|---|---|---|
+| Authoritative for | nothing — it is a best-effort *mirror* of the journal | **delivery** of one outbound reply |
+| Source of truth | the local hash-chained journal | the `outbox` field on the session file |
+| Stored where | derived from `audit.log` | `Session.outbox` (per-thread state file) — **never** `audit.log` |
+| May block tool execution? | never (invariant 1) | never — recorded *before* the send, drained out-of-band by the poller |
+| Direction | one-way journal → projection | one-way turn-terminal → outbox → poller → Slack |
+
+Three rules keep them disjoint:
+
+1. **The obligation is never written to `audit.log`.** It lives in the session
+   file. The journal records *that a reply was owed/sent* as ordinary events if
+   at all; it is not the delivery ledger.
+2. **The audit projection is never made authoritative for delivery.** A reply
+   appearing (or not) in the `#audit` projection says nothing about whether the
+   reply was delivered — only the outbox does.
+3. **Neither blocks tool execution.** The projection swallows failures
+   (invariant 1); the outbox is written atomically with the turn's terminal
+   marker and drained by a *separate* leased poller (`ccsc-o7x.2.2`), so a
+   Slack outage delays delivery without stalling the turn.
+
+#### The delivery poller (`ccsc-o7x.2.2`)
+
+`supervisor.drainOutbox(send, opts?)` is the **consumer** side of the outbox —
+one pass over every `pending` obligation (`pendingDeliveries()`). For each it
+performs the real Slack send via the injected `send` and resolves the obligation
+in one fenced write, replacing the old stderr-and-swallow on a failed
+`chat.postMessage`:
+
+- **success** → `state: 'delivered'`, `attempts` incremented;
+- **retryable** error (rate limiting, transient 5xx, network — `classifyDeliveryError`
+  in `lib.ts`) → retried in-pass with exponential backoff (`computeBackoffMs`) up
+  to `maxAttempts` (default `DEFAULT_MAX_DELIVERY_ATTEMPTS = 5`), then dead-lettered
+  if still failing — bounded, never an infinite loop;
+- **non-retryable** error (channel gone, bad auth, payload malformed — the
+  `NON_RETRYABLE_SLACK_ERRORS` set) → `state: 'dead'` immediately, the Slack error
+  code recorded in `lastError` (a dead-letter is never a silent black hole).
+
+The classification + backoff helpers are pure functions in `lib.ts` (so they are
+unit-testable and the supervisor keeps zero Slack-SDK coupling); the send loop +
+state transitions live in `supervisor.ts` (outside AGP's vendored kernel).
+
+**Lease discipline — why the poller can't double-send.** Every obligation is
+delivered under the fencing lease held over its session (`ccsc-o7x.1.1`). The
+poller re-checks the lease (`heartbeat`) immediately *before each send* and again
+*before the persist*; if a newer owner has superseded it, the poller yields
+without sending (or without committing) and leaves the obligation `pending` for
+that owner — so a stale owner never races a live one into a duplicate post. The
+benign lease-loss yield does **not** quarantine the session (that would lock out
+the legitimate new owner); only a genuine fenced write or save failure does. The
+residual crash-window duplicate — *sent but not yet marked delivered* — is closed
+by the idempotency key (`DeliveryObligation.id`) in `ccsc-o7x.2.3`; the lease
+covers the in-process superseded-owner race, idempotency covers the cross-restart
+one. Throughout, the poller touches **only** the outbox — never `audit.log`,
+never the projection (the three rules above hold unchanged).
+
+#### Idempotent redelivery (`ccsc-o7x.2.3`)
+
+The lease stops a *superseded owner* from double-sending, but it cannot help the
+**ambiguous failure**: the post reached Slack and the message landed, but the ack
+was lost (timeout / crash) before the obligation could be marked `delivered`. On
+the next pass the obligation is still `pending`, so a naive retry would post the
+reply twice. The fix is a deterministic idempotency key:
+
+- `deliveryIdempotencyKey(ob)` (pure, `lib.ts`) derives `ccsc-reply:<id>` from the
+  obligation's stable `id` (the same id the 2.1 doc calls the logical-message
+  identity). Same obligation → same key, across restarts.
+- `makeIdempotentSend(deps)` (pure combinator, `lib.ts`) wraps a raw Slack post:
+  before posting it asks `deps.findDelivered(channel, thread, key)` whether a
+  message bearing that key already exists in the thread; if so the send is a
+  **no-op** (the prior post stands), otherwise it posts under the key
+  (`deps.post` stamps it into Slack message `metadata`, `event_type`
+  `ccsc_reply_delivery`). The poller (`drainOutbox`) consumes the wrapped `send`
+  unchanged — idempotency is a property of the send, not of the poll loop.
+
+So **exactly-once visible delivery = lease (in-process) + idempotency key
+(cross-restart)**: the lease blocks the live race, the key makes any replay after
+an ack-loss window a no-op. `lib.ts` imports no Slack SDK — the production
+`findDelivered` (scan `conversations.replies` for our delivery metadata) and
+`post` (`chat.postMessage` with the key stamped) are injected from `server.ts`,
+so the combinator stays in AGP's vendored kernel.
 
 ---
 

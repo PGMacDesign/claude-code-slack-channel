@@ -5,7 +5,7 @@
  * parameters) so they can be imported by server.test.ts without starting the
  * Slack socket or loading credentials.
  *
- * SPDX-License-Identifier: MIT
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 import { randomBytes } from 'node:crypto'
@@ -13,7 +13,10 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSyn
 import { chmod, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { basename, join, resolve, sep } from 'node:path'
 import { z } from 'zod'
-import { DEFAULT_PEER_BOT_RATE_LIMIT } from './peer-bot-rate-limit.ts'
+import {
+  DEFAULT_CHANNEL_CIRCUIT_BREAKER,
+  DEFAULT_PEER_BOT_RATE_LIMIT,
+} from './peer-bot-rate-limit.ts'
 
 // ---------------------------------------------------------------------------
 // Constants (re-exported so server.ts and tests share the same values)
@@ -77,6 +80,20 @@ export interface ChannelPolicy {
    *  applies (10 msgs in 60s). Set `{ count: 0, windowMs: 0 }` only
    *  to explicitly DISABLE the limit; default-on is intentional. */
   peerBotRateLimit?: { count: number; windowMs: number }
+  /** Channel-wide circuit breaker for N-cycle (A→B→C→A) peer-bot loops
+   *  (ccsc-0k7x2). The per-(channel, bot) `peerBotRateLimit` only breaks
+   *  PAIRWISE loops; a 3+-bot ring keeps each sender under its own cap, so
+   *  this aggregate counter trips the whole channel's bot traffic when total
+   *  peer-bot velocity is runaway-high. Absent →
+   *  DEFAULT_CHANNEL_CIRCUIT_BREAKER (40 msgs in 60s). Set
+   *  `{ count: 0, windowMs: 0 }` to DISABLE; default-on is intentional. */
+  channelCircuitBreaker?: { count: number; windowMs: number }
+  /** Per-user session isolation (ccsc-kl410). When true, each distinct sender
+   *  in this channel gets their own session within a shared thread — separate
+   *  state file + supervisor handle + ownerId — so two humans in one thread do
+   *  not share context/ownership. Absent or false → one shared session per
+   *  (channel, thread) (the default; behavior unchanged). */
+  perUserSessions?: boolean
 }
 
 export interface PendingEntry {
@@ -109,14 +126,29 @@ export interface Access {
 
 export type GateAction = 'deliver' | 'drop' | 'pair'
 
-/** Structured reason for a drop. Optional — only set by drop paths
- *  that benefit from operator-visible distinguishing. Self-echo and
- *  generic policy-miss drops omit it; rate-limit drops (ccsc-gyt)
- *  surface as `'rate.cross_bot_loop'` so an operator can grep the
- *  journal for runaway-loop incidents. */
+/** Structured reason for a drop. As of ccsc-apj.2 EVERY inbound gate
+ *  drop carries one, so an operator reading the journal can always tell
+ *  *why* Claude stayed silent (gate.inbound.drop records it — server.ts).
+ *  Grouped by the stage that produced the drop. */
 export type GateDropReason =
-  | 'rate.cross_bot_loop' // ccsc-gyt — peer-bot exceeded per-(channel, bot_id) sliding window
-  | 'admin.muted' // ccsc-gjm (future) — operator muted this peer bot in this channel
+  // -- bot-event stage (handleBotEvent) --
+  | 'self.echo' // dropped our own message (bot_id / app_id / botUserId match)
+  | 'bot.not_allowlisted' // peer bot not in the channel's allowBotIds
+  | 'admin.muted' // ccsc-gjm — operator muted this peer bot in this channel
+  | 'rate.cross_bot_loop' // ccsc-gyt — peer bot exceeded per-(channel, bot_id) sliding window
+  | 'rate.channel_cycle' // ccsc-0k7x2 — channel-wide peer-bot velocity tripped the circuit breaker (N-cycle ring)
+  | 'bot.permission_relay' // peer-bot message looked like a permission-approval relay
+  // -- top-level stage (gate) --
+  | 'subtype.filtered' // non-message subtype (message_changed, message_deleted, …) — see ccsc-apj.3
+  | 'event.no_user' // event carried no user id
+  // -- DM stage (handleDmEvent) --
+  | 'dm.policy_closed' // dmPolicy is 'allowlist'/'disabled' and sender not allowlisted
+  | 'dm.pairing_cap' // sender hit MAX_PAIRING_REPLIES for their pending code
+  | 'dm.pending_full' // MAX_PENDING pairing codes outstanding
+  // -- channel stage (handleChannelEvent) --
+  | 'channel.not_opted' // channel not opted in (no ChannelPolicy)
+  | 'channel.allowfrom_miss' // sender not in the channel's allowFrom
+  | 'channel.require_mention' // requireMention channel, no mention, thread not engaged (ccsc-apj.1)
 
 export interface GateResult {
   action: GateAction
@@ -145,6 +177,13 @@ export interface SessionKey {
   /** Slack thread_ts, e.g. `1711000000.000100`. For top-level messages the
    *  supervisor uses the message `ts` as the thread value. */
   thread: string
+  /** Optional Slack user_id for per-user session isolation (ccsc-kl410). When a
+   *  channel sets `perUserSessions`, each distinct sender gets their own
+   *  session WITHIN a shared thread — a distinct supervisor `keyId` and a
+   *  distinct on-disk file (`sessions/<channel>/<userId>/<thread>.json`) — so
+   *  two humans talking in one thread don't share session state / ownerId.
+   *  Absent → the legacy shared per-(channel, thread) session. */
+  userId?: string
 }
 
 /** Schema version for a persisted Session file. Bumped on incompatible
@@ -163,6 +202,246 @@ export type SessionSchemaVersion = 1
  *  This type is the *file* shape; the in-memory SessionHandle (32-B.1,
  *  supervisor.ts) wraps it with mutex and lifecycle metadata.
  */
+/** Persisted marker that a turn was in flight when the session file was last
+ *  written (ccsc-o7x.1.2). Written by the supervisor at turn start, cleared at
+ *  turn end. If the process crashes mid-turn the marker survives on disk, and
+ *  the boot-time recovery sweep (`recoverOnStartup`) reads it to decide whether
+ *  the turn can be requeued (its owner is provably dead — heartbeat lapsed) or
+ *  must be orphaned into quarantine (heartbeat still fresh — a second live owner
+ *  cannot be ruled out; fail closed). The supervisor's fencing lease
+ *  (`Lease` in supervisor.ts) is the in-memory counterpart; this is its durable
+ *  footprint. */
+export interface InFlightTurn {
+  /** Lease owner that started the turn (the supervisor process). */
+  owner: string
+  /** Lease token at turn start. The sweep seeds its monotonic token counter
+   *  above any persisted token so a restarted process never re-issues one a
+   *  crashed owner already held (crash-durable monotonicity). */
+  token: number
+  /** Epoch-ms the turn began. */
+  startedAt: number
+  /** Epoch-ms of the most recent persisted heartbeat for the turn. The sweep
+   *  classifies on this: lapsed past the lease TTL ⇒ resumable. */
+  heartbeatAt: number
+}
+
+/** A durable "reply owed" obligation — the transactional-outbox record for one
+ *  outbound Slack message a completed turn still owes (ccsc-o7x.2.1). Persisted
+ *  on the `Session` file (in `outbox`) atomically with the turn's terminal
+ *  marker, BEFORE the Slack send is attempted, so a crash after
+ *  terminal-but-before-send leaves a pending obligation the delivery poller
+ *  (ccsc-o7x.2.2) can later honor. The send becomes a *consumer* of this record,
+ *  not a fire-and-forget side effect.
+ *
+ *  This is a SEPARATE sink from the audit journal/projection: the outbox is
+ *  authoritative for *delivery*, the journal for *what happened*. They never
+ *  cross — the obligation is NOT written to `audit.log`, and the audit
+ *  projection is never made authoritative for delivery (audit-journal-
+ *  architecture.md invariant 1). */
+export interface DeliveryObligation {
+  /** Stable delivery id — the idempotency / dedup key (consumed by
+   *  ccsc-o7x.2.3 so redelivery never double-posts). Two records with the same
+   *  id denote the same logical message. */
+  id: string
+  /** Destination channel. */
+  channel: string
+  /** Destination `thread_ts`, or '' for a top-level channel post. */
+  thread: string
+  /** The reply payload to send (message text). */
+  payload: string
+  /** Delivery attempts made so far. Starts at 0; the poller increments. */
+  attempts: number
+  /** Lifecycle state. `pending` awaits delivery; `delivered` / `dead` are
+   *  terminal and set by the poller (ccsc-o7x.2.2). */
+  state: 'pending' | 'delivered' | 'dead'
+  /** Epoch-ms the obligation was recorded. */
+  createdAt: number
+  /** The most recent failure's Slack error code (or message when no code is
+   *  extractable), recorded by the delivery poller (ccsc-o7x.2.2) on each failed
+   *  attempt and on dead-letter — a dead-lettered obligation must carry WHY it
+   *  was abandoned, never a silent black hole. Absent until the first failure;
+   *  additive + optional so 2.1-era records and clean sends carry no field. */
+  lastError?: string
+  /** ccsc-o7x.5 — file-upload obligation. When present, this obligation is a
+   *  durable FILE upload (`filesUploadV2`), NOT a text post: the send branches to
+   *  upload `upload.path` as `upload.filename` (with optional `upload.comment` as
+   *  the initial comment) and `payload` is unused. The send re-runs the outbound
+   *  file exfil guards on `upload.path` before EVERY upload (incl. poller
+   *  redelivery), because a file's bytes can change between record and redelivery
+   *  (ADR-002 addendum). Additive + optional, so text obligations and pre-o7x.5
+   *  records are unchanged. */
+  upload?: { path: string; filename: string; comment?: string }
+  /** ccsc-o7x.5 — Slack file id recorded AFTER a successful upload. A poller
+   *  redelivery of the same file obligation dedups by checking this file is still
+   *  shared in the thread (file shares carry no app `metadata`, so this recorded
+   *  id — plus a `(filename, size)` thread scan — is the dedup anchor). Absent
+   *  until the first successful upload. */
+  uploadedFileId?: string
+}
+
+/** How the delivery poller (ccsc-o7x.2.2) treats a failed send. `retryable`
+ *  errors (rate limiting, transient 5xx, network blips) are retried with
+ *  backoff up to a cap; `non-retryable` errors are permanent for this
+ *  (channel, payload) — dead-letter the obligation rather than retry forever. */
+export type DeliveryErrorClass = 'retryable' | 'non-retryable'
+
+/** Slack Web API error codes that are permanent for a given (channel, payload):
+ *  no amount of retrying can make the send succeed, so the obligation is
+ *  dead-lettered immediately. Anything NOT in this set (rate limiting, 5xx,
+ *  network errors, unknown codes) defaults to `retryable` — bounded by the
+ *  poller's attempt cap, so even a persistently-failing "retryable" error
+ *  converges to dead-letter instead of looping forever. Conservative by design:
+ *  an unrecognised transient error gets retries (then dead-letters) rather than
+ *  being thrown away on the first failure. (ccsc-o7x.2.2) */
+export const NON_RETRYABLE_SLACK_ERRORS: ReadonlySet<string> = new Set([
+  // Destination is gone or unreachable for this bot.
+  'channel_not_found',
+  'not_in_channel',
+  'is_archived',
+  'cannot_dm_bot',
+  'user_not_found',
+  'user_disabled',
+  // Credentials / authorization are dead — retrying with the same token cannot
+  // succeed (rotation/operator action required).
+  'invalid_auth',
+  'account_inactive',
+  'token_revoked',
+  'token_expired',
+  'no_permission',
+  'ekm_access_denied',
+  // Payload is malformed — the same bytes will always be rejected.
+  'msg_too_long',
+  'no_text',
+  'messages_tab_disabled',
+  // Workspace/channel policy forbids the action.
+  'restricted_action',
+  'restricted_action_read_only_channel',
+  'restricted_action_thread_only_channel',
+  'restricted_action_non_threadable_channel',
+])
+
+/** Classify a Slack delivery failure by its extracted error `code` (see
+ *  `extractSlackErrorCode`). A code in `NON_RETRYABLE_SLACK_ERRORS` is permanent;
+ *  everything else — including `undefined` (no code extractable) and rate-limit /
+ *  network codes — is `retryable`. Pure. (ccsc-o7x.2.2) */
+export function classifyDeliveryError(code: string | undefined): DeliveryErrorClass {
+  if (code !== undefined && NON_RETRYABLE_SLACK_ERRORS.has(code)) return 'non-retryable'
+  return 'retryable'
+}
+
+/** Best-effort extraction of a stable error code from an unknown thrown value,
+ *  WITHOUT importing the Slack SDK (lib.ts stays dependency-light + vendored).
+ *  Order of preference:
+ *    1. `err.data.error` — the canonical Slack Web API code on a
+ *       `WebAPIPlatformError` (e.g. `'channel_not_found'`).
+ *    2. `err.code` — the SDK/runtime code fallback (e.g.
+ *       `'slack_webapi_rate_limited_error'`, or a Node network errno like
+ *       `'ECONNRESET'`), used only when no platform code is present.
+ *  Returns `undefined` for a non-object throw or when neither field is a
+ *  non-empty string, in which case `classifyDeliveryError` treats it as
+ *  retryable. Pure. (ccsc-o7x.2.2) */
+export function extractSlackErrorCode(err: unknown): string | undefined {
+  if (typeof err !== 'object' || err === null) return undefined
+  const e = err as Record<string, unknown>
+  const data = e.data
+  if (typeof data === 'object' && data !== null) {
+    const dataErr = (data as Record<string, unknown>).error
+    if (typeof dataErr === 'string' && dataErr.length > 0) return dataErr
+  }
+  if (typeof e.code === 'string' && e.code.length > 0) return e.code
+  return undefined
+}
+
+/** Thrown when an outbound file fails the exfil guard (`assertSendable` denylist,
+ *  or a secret value in the content/filename) — ccsc-o7x.5. Lives in the kernel
+ *  (not `slack-delivery.ts`) so BOTH the inline durable file path AND the delivery
+ *  poller (`supervisor.ts` `drainOutbox`) can classify it as **non-retryable**
+ *  without a slack-delivery↔supervisor import cycle: a blocked file is marked
+ *  `dead`, never uploaded, never retried (its bytes won't pass on a retry, and
+ *  the agent must see the block). The guard impl journals `exfil.block` before
+ *  throwing this. */
+export class ExfilBlockedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ExfilBlockedError'
+  }
+}
+
+/** Tunables for `computeBackoffMs`. */
+export interface BackoffOptions {
+  /** Delay before the first retry, in ms. Default 250. */
+  baseMs?: number
+  /** Multiplier applied per attempt. Default 2 (exponential). */
+  factor?: number
+  /** Upper bound on a single backoff, in ms. Default 30_000 (30s). */
+  maxMs?: number
+}
+
+/** Exponential backoff for the `n`-th retry (1-based): `baseMs * factor^(n-1)`,
+ *  clamped to `maxMs`. `attempt <= 0` yields `0` (no wait before the first try).
+ *  Deterministic (no jitter) so the poller's retry schedule is reproducible in
+ *  tests; a single-poller deployment has no thundering-herd to jitter against.
+ *  Pure. (ccsc-o7x.2.2) */
+export function computeBackoffMs(attempt: number, opts: BackoffOptions = {}): number {
+  if (attempt <= 0) return 0
+  const baseMs = opts.baseMs ?? 250
+  const factor = opts.factor ?? 2
+  const maxMs = opts.maxMs ?? 30_000
+  return Math.min(baseMs * factor ** (attempt - 1), maxMs)
+}
+
+/** Slack message-metadata `event_type` marking a message as a CCSC reply
+ *  delivery. The production send stamps it (alongside the idempotency key) so a
+ *  redelivery's `findDelivered` can recognize our own prior post. (ccsc-o7x.2.3) */
+export const DELIVERY_METADATA_EVENT_TYPE = 'ccsc_reply_delivery'
+
+/** Deterministic idempotency key for a delivery obligation — derived purely from
+ *  its stable `id` (the dedup key from ccsc-o7x.2.1: two records with the same id
+ *  denote the same logical message). Stamped on the outbound Slack message so a
+ *  replayed send after an *ambiguous* failure (the message posted, but the ack
+ *  was lost before the obligation could be marked delivered — ccsc-o7x.2.2's
+ *  residual crash window) can be recognized and skipped: at-most-once visible
+ *  delivery. Pure. (ccsc-o7x.2.3) */
+export function deliveryIdempotencyKey(obligation: DeliveryObligation): string {
+  return `ccsc-reply:${obligation.id}`
+}
+
+/** Injected I/O for `makeIdempotentSend`. The production adapter lives in
+ *  `server.ts` (scans `conversations.replies` for our delivery metadata, posts
+ *  via `chat.postMessage` with the key stamped into message metadata); tests
+ *  inject a fake Slack store. Kept as an interface so `lib.ts` imports no Slack
+ *  SDK and stays in AGP's vendored kernel. (ccsc-o7x.2.3) */
+export interface IdempotentSendDeps {
+  /** Whether a message bearing `key` already exists in (channel, thread).
+   *  Returns a truthy marker (e.g. the existing Slack `ts`) if already posted,
+   *  else `null`. */
+  findDelivered(channel: string, thread: string, key: string): Promise<string | null>
+  /** Post `obligation.payload`, stamping `key` so a later `findDelivered` can
+   *  recognize it. Resolves on success; throws on failure (the delivery poller
+   *  classifies + retries / dead-letters). */
+  post(obligation: DeliveryObligation, key: string): Promise<void>
+}
+
+/** Wrap a raw Slack post with idempotency: before posting, check whether a
+ *  message bearing this obligation's deterministic key was already delivered; if
+ *  so the send is a **no-op** (the prior post stands). Otherwise post under the
+ *  key. This is what makes the delivery poller's redelivery safe across the
+ *  ack-loss crash window (`ccsc-o7x.2.2`'s residual): the poller may re-attempt
+ *  freely and never double-posts — exactly-once visible delivery is the lease
+ *  (in-process) plus this key (cross-restart). Pure combinator over injected I/O
+ *  (no Slack-SDK import → vendored-kernel safe); the returned function is the
+ *  `send` that `SessionSupervisor.drainOutbox` consumes. (ccsc-o7x.2.3) */
+export function makeIdempotentSend(
+  deps: IdempotentSendDeps,
+): (obligation: DeliveryObligation) => Promise<void> {
+  return async (obligation) => {
+    const key = deliveryIdempotencyKey(obligation)
+    const existing = await deps.findDelivered(obligation.channel, obligation.thread, key)
+    if (existing) return
+    await deps.post(obligation, key)
+  }
+}
+
 export interface Session {
   /** Schema version of this session file. */
   v: SessionSchemaVersion
@@ -184,6 +463,15 @@ export interface Session {
    *  history, policy approvals, conversation scratchpad) are wired in.
    *  32-A tests treat this field as an arbitrary object. */
   data: Record<string, unknown>
+  /** Optional crash-recovery marker (ccsc-o7x.1.2). Present only while a turn
+   *  is in flight; absent on a cleanly-idle session. Additive + optional, so
+   *  pre-existing session files (which never carry it) load unchanged. */
+  inFlightTurn?: InFlightTurn
+  /** Optional transactional-outbox: pending "reply owed" obligations for this
+   *  thread (ccsc-o7x.2.1). Written atomically with the turn's terminal marker,
+   *  drained by the delivery poller (ccsc-o7x.2.2). Additive + optional, so
+   *  pre-existing session files load unchanged. */
+  outbox?: DeliveryObligation[]
 }
 
 /** Zod schema mirroring the `Session` interface.
@@ -209,6 +497,50 @@ export const SessionSchema = z
     lastActiveAt: z.number(),
     ownerId: z.string(),
     data: z.record(z.unknown()),
+    // ccsc-o7x.1.2 — optional crash-recovery marker. Optional so existing
+    // session files (written before this field existed) still validate under
+    // the outer `.strict()`.
+    inFlightTurn: z
+      .object({
+        owner: z.string(),
+        token: z.number(),
+        startedAt: z.number(),
+        heartbeatAt: z.number(),
+      })
+      .strict()
+      .optional(),
+    // ccsc-o7x.2.1 — optional transactional outbox of pending reply obligations.
+    // Optional so existing session files validate under the outer `.strict()`.
+    outbox: z
+      .array(
+        z
+          .object({
+            id: z.string(),
+            channel: z.string(),
+            thread: z.string(),
+            payload: z.string(),
+            attempts: z.number(),
+            state: z.enum(['pending', 'delivered', 'dead']),
+            createdAt: z.number(),
+            // ccsc-o7x.2.2 — optional last-failure marker (Slack error code or
+            // message). Optional so 2.1-era records validate under `.strict()`.
+            lastError: z.string().optional(),
+            // ccsc-o7x.5 — optional file-upload descriptor + recorded file id.
+            // Optional so text obligations + pre-o7x.5 records validate under
+            // the outer `.strict()`.
+            upload: z
+              .object({
+                path: z.string(),
+                filename: z.string(),
+                comment: z.string().optional(),
+              })
+              .strict()
+              .optional(),
+            uploadedFileId: z.string().optional(),
+          })
+          .strict(),
+      )
+      .optional(),
   })
   .strict()
 
@@ -267,30 +599,39 @@ export function sessionPath(root: string, key: SessionKey): string {
   if (!isValidSessionComponent(key.thread)) {
     throw new Error(`sessionPath: invalid thread component: ${JSON.stringify(key.thread)}`)
   }
+  // ccsc-kl410 — per-user isolation adds a `userId` directory level. Validate
+  // it with the SAME component rule (no `.`/`..`, restricted charset) so it
+  // can never inject path traversal — the on-disk leaf becomes
+  // `sessions/<channel>/<userId>/<thread>.json`.
+  if (key.userId !== undefined && (key.userId === '' || !isValidSessionComponent(key.userId))) {
+    throw new Error(`sessionPath: invalid userId component: ${JSON.stringify(key.userId)}`)
+  }
 
   // Canonicalize the state root. Throws ENOENT if the caller did not
   // pre-create it — matches server.ts bootstrap which mkdirs STATE_DIR
   // before any session activity.
   const resolvedRoot = realpathSync.native(resolve(root))
 
-  // Rule 3: create sessions/<channel>/ at 0o700. mkdirSync(recursive)
-  // is idempotent; the mode applies only to newly created dirs, which
-  // is the doc's "on first use" semantic.
+  // Rule 3: create the session leaf dir at 0o700 — `sessions/<channel>/`
+  // (shared) or `sessions/<channel>/<userId>/` (per-user). mkdirSync(recursive)
+  // is idempotent; the mode applies only to newly created dirs, which is the
+  // doc's "on first use" semantic.
   const channelDir = join(resolvedRoot, 'sessions', key.channel)
-  mkdirSync(channelDir, { recursive: true, mode: 0o700 })
+  const leafDir = key.userId !== undefined ? join(channelDir, key.userId) : channelDir
+  mkdirSync(leafDir, { recursive: true, mode: 0o700 })
 
-  // Rule 2: realpath the (now-extant) per-channel dir and assert the
-  // state root is still a prefix. Catches symlink-based escape.
-  const resolvedChannelDir = realpathSync.native(channelDir)
-  if (!isUnderRoot(resolvedChannelDir, resolvedRoot)) {
+  // Rule 2: realpath the (now-extant) leaf dir and assert the state root is
+  // still a prefix. Catches symlink-based escape via channel OR userId.
+  const resolvedLeafDir = realpathSync.native(leafDir)
+  if (!isUnderRoot(resolvedLeafDir, resolvedRoot)) {
     throw new Error(
-      `sessionPath: resolved channel dir escapes state root (channel=${JSON.stringify(
+      `sessionPath: resolved session dir escapes state root (channel=${JSON.stringify(
         key.channel,
-      )})`,
+      )}, userId=${JSON.stringify(key.userId)})`,
     )
   }
 
-  return join(resolvedChannelDir, `${key.thread}.json`)
+  return join(resolvedLeafDir, `${key.thread}.json`)
 }
 
 /** Atomic writer for session files.
@@ -723,6 +1064,200 @@ export function generateCode(): string {
 }
 
 // ---------------------------------------------------------------------------
+// Secret declarations — single source of placeholder, guard, and routing
+// (ccsc-z0n.1; ADR-002 §1 credential placeholder-swap + §6 declaration-as-enforcement)
+// ---------------------------------------------------------------------------
+
+/**
+ * The outbound destinations a declared secret's *real* value is allowed to
+ * reach. A secret value appearing in a payload bound for any other sink — or in
+ * any agent-readable surface — is an exfiltration attempt (see ccsc-z0n.3,
+ * which makes the outbound guard a value-exfiltration guard over this set).
+ *
+ * `'none'` is the deny-all sink: a secret declared with `allowedSink: 'none'`
+ * may never appear in any outbound payload at all.
+ */
+export type SecretSink = 'slack-web-api' | 'slack-socket-api' | 'none'
+
+/**
+ * One declared secret. This is the ONLY place a secret's identity is defined.
+ * The placeholder the agent sees, the outbound value-exfiltration guard, and
+ * the host-bound routing rule are all *derived* from this table — never
+ * redeclared — so the three enforcement points cannot drift apart
+ * (ADR-002 §6, declaration-as-enforcement).
+ */
+export interface SecretDeclaration {
+  /** Canonical identity. Conventionally equal to `envVar`, but the identity is
+   *  the contract; the transport (env var) is incidental. */
+  readonly name: string
+  /** The environment variable the real value is loaded from on the host. */
+  readonly envVar: string
+  /** Literal prefix every live value of this secret carries (e.g. `xoxb-`).
+   *  Lets a shape check distinguish a real value from a placeholder without
+   *  hardcoding the prefix at each call site. Empty = no known prefix. */
+  readonly valuePrefix: string
+  /** Where the real value is swapped in for its placeholder — the single
+   *  outbound boundary that resolves it (ccsc-z0n.2). Description only; the
+   *  injection code names this point. */
+  readonly injectionPoint: string
+  /** The only sink the real value may travel to. Routing + the guard read
+   *  their decision from here. */
+  readonly allowedSink: SecretSink
+  /** Operator/doc-facing note. */
+  readonly description: string
+}
+
+/**
+ * The declared-secret table — the single source of truth for every secret
+ * CCSC's host process holds. Adding a secret means adding a row here and
+ * nowhere else; the placeholder, guard watch-set, and routing all derive from
+ * it. Frozen so it cannot be mutated at runtime.
+ *
+ * Today: the two Slack tokens the runtime loads from `.env` (server.ts).
+ */
+export const SECRET_DECLARATIONS: readonly SecretDeclaration[] = Object.freeze([
+  {
+    name: 'SLACK_BOT_TOKEN',
+    envVar: 'SLACK_BOT_TOKEN',
+    valuePrefix: 'xoxb-',
+    injectionPoint: 'slack-web-client',
+    allowedSink: 'slack-web-api',
+    description: 'Slack bot user OAuth token; authenticates outbound Web API calls.',
+  },
+  {
+    name: 'SLACK_APP_TOKEN',
+    envVar: 'SLACK_APP_TOKEN',
+    valuePrefix: 'xapp-',
+    injectionPoint: 'slack-socket-client',
+    allowedSink: 'slack-socket-api',
+    description: 'Slack app-level token; authenticates the Socket Mode WebSocket.',
+  },
+] as const)
+
+/**
+ * The placeholder string the agent sees in place of a real secret value.
+ * A pure, total function of the declared name — there is no second source for
+ * it, so the placeholder can never drift from the declaration. The wrapping
+ * `{{CCSC_SECRET:…}}` form is deliberately unmistakable and round-trips via
+ * `secretNameFromPlaceholder`.
+ */
+export function secretPlaceholder(name: string): string {
+  return `{{CCSC_SECRET:${name}}}`
+}
+
+const SECRET_PLACEHOLDER_RE = /^\{\{CCSC_SECRET:([A-Za-z0-9_]+)\}\}$/
+
+/**
+ * Inverse of `secretPlaceholder`: returns the declared name encoded in a
+ * placeholder string, or `undefined` if `s` is not a well-formed placeholder.
+ * Used by the injector (ccsc-z0n.2) to know which secret to swap in.
+ */
+export function secretNameFromPlaceholder(s: string): string | undefined {
+  const m = SECRET_PLACEHOLDER_RE.exec(s)
+  return m ? m[1] : undefined
+}
+
+/** Look up a single declaration by canonical name. */
+export function findSecretDeclaration(name: string): SecretDeclaration | undefined {
+  return SECRET_DECLARATIONS.find((d) => d.name === name)
+}
+
+/** Every declared secret name. The guard (ccsc-z0n.3) derives its watch-set
+ *  from this — it never maintains its own list of secret names. */
+export function declaredSecretNames(): string[] {
+  return SECRET_DECLARATIONS.map((d) => d.name)
+}
+
+/** The allowed sink for a declared secret, or `undefined` if not declared.
+ *  The routing layer and the value-exfiltration guard (ccsc-z0n.3) both read
+ *  their routing decision from here. */
+export function allowedSinkFor(name: string): SecretSink | undefined {
+  return findSecretDeclaration(name)?.allowedSink
+}
+
+/**
+ * Build the set of *live* secret values the outbound guard must block, derived
+ * from the declaration table by resolving each declared secret through
+ * `resolve` (typically `(d) => process.env[d.envVar]`). Secrets that resolve to
+ * an empty / undefined value are skipped — an unset secret has no value to
+ * leak.
+ *
+ * This is the seam ccsc-z0n.3 consumes: the guard never hardcodes a value or a
+ * name; it asks the table. The returned Set keeps membership checks O(1) and
+ * collapses duplicates if two declarations happen to share a value.
+ */
+export function buildSecretValueSet(
+  resolve: (declaration: SecretDeclaration) => string | undefined,
+): Set<string> {
+  const out = new Set<string>()
+  for (const d of SECRET_DECLARATIONS) {
+    const v = resolve(d)
+    if (typeof v === 'string' && v.length > 0) out.add(v)
+  }
+  return out
+}
+
+/**
+ * Build a live-value → placeholder map from the declaration table (ccsc-z0n.2),
+ * resolving each declaration's value via `resolve` (typically
+ * `(d) => process.env[d.envVar]`). The inbound result scrub uses this to replace
+ * any live secret value that surfaces in an agent-facing tool result with that
+ * secret's stable placeholder — the same `secretPlaceholder(name)` the
+ * declaration defines (ccsc-z0n.1), so the agent sees a recognizable placeholder
+ * rather than a raw or generically-redacted value. Secrets with no resolved
+ * value are skipped (nothing to scrub).
+ */
+export function buildSecretPlaceholderMap(
+  resolve: (declaration: SecretDeclaration) => string | undefined,
+): Map<string, string> {
+  const out = new Map<string, string>()
+  for (const d of SECRET_DECLARATIONS) {
+    const v = resolve(d)
+    if (typeof v === 'string' && v.length > 0) out.set(v, secretPlaceholder(d.name))
+  }
+  return out
+}
+
+/**
+ * Replace every occurrence of a declared secret value in `text` with its
+ * placeholder (ccsc-z0n.2). The inbound (tool-result → agent) complement of
+ * `assertNoSecretValues` on the outbound (agent → Slack) direction.
+ *
+ * **Why this is defense-in-depth, not the primary control.** CCSC's architecture
+ * already keeps tokens out of agent-readable surfaces: the Claude Code session
+ * *spawns* the bridge as a separate MCP-stdio subprocess (ARCHITECTURE.md), and
+ * the tokens live only in the bridge process, flowing only into Slack-bound
+ * sinks — never into a tool result. This scrub is the backstop: if a future tool
+ * or refactor ever placed a live token in a result, it is swapped to a
+ * placeholder before the agent can read it, and the caller can journal the
+ * near-miss (the non-zero `redactedCount`). It is *not* a placeholder-injection
+ * layer — there is nothing to inject, because the agent never holds the value.
+ *
+ * Uses literal split/join (not regex) so secret values need no escaping. Returns
+ * the input unchanged with `redactedCount: 0` when nothing matched (the common
+ * case, kept allocation-light). Pure over its inputs.
+ */
+export function redactSecretValues(
+  text: string,
+  placeholders: ReadonlyMap<string, string>,
+): { text: string; redactedCount: number } {
+  if (typeof text !== 'string' || text.length === 0 || placeholders.size === 0) {
+    return { text: typeof text === 'string' ? text : '', redactedCount: 0 }
+  }
+  let out = text
+  let redactedCount = 0
+  for (const [value, placeholder] of placeholders) {
+    if (value.length === 0) continue
+    const parts = out.split(value)
+    if (parts.length > 1) {
+      redactedCount += parts.length - 1
+      out = parts.join(placeholder)
+    }
+  }
+  return { text: out, redactedCount }
+}
+
+// ---------------------------------------------------------------------------
 // Security — assertSendable (file exfiltration guard)
 // ---------------------------------------------------------------------------
 
@@ -952,6 +1487,36 @@ export function assertSendable(
   }
 }
 
+/**
+ * Throws if `payload` contains any declared-secret *value* (ccsc-z0n.3).
+ *
+ * The companion to `assertSendable`: where that guard blocks secret *files* by
+ * path, this blocks secret *values* by content — closing the case where a live
+ * token is pasted into message text, a file body, or an attachment rather than
+ * a state file. This is the **additive** value-exfiltration guard from the
+ * token-firewall epic (ccsc-z0n): `assertSendable`'s signature is deliberately
+ * left unchanged because `lib.ts` is vendored by AGP (ADR 009) — the two guards
+ * compose, they do not merge. (When this lands, AGP flags a deliberate kernel
+ * re-sync in `substrate/UPSTREAM.md`; AGP wants the stronger guard too.)
+ *
+ * `secretValues` is the live-value set built by `buildSecretValueSet` from the
+ * `SECRET_DECLARATIONS` table (ccsc-z0n.1) — the guard never hardcodes a value
+ * or a name. An empty set is a no-op (no declared secret has a resolved value
+ * to leak), so a deployment with no secrets configured pays nothing.
+ *
+ * Pure over its inputs. The thrown message NEVER echoes the matched value or
+ * the surrounding payload — echoing either would itself open a leak channel
+ * (the same discipline `assertSendable` follows for paths).
+ */
+export function assertNoSecretValues(payload: string, secretValues: ReadonlySet<string>): void {
+  if (typeof payload !== 'string' || payload.length === 0) return
+  for (const value of secretValues) {
+    if (value.length > 0 && payload.includes(value)) {
+      throw new Error('Blocked: outbound payload contains a declared secret value')
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Security — outbound gate
 // ---------------------------------------------------------------------------
@@ -1160,6 +1725,21 @@ export interface GateOptions {
    *  tests can use a deterministic Date.now(). Defaults to wall
    *  clock. */
   now?: () => number
+  /** Session-thread keys — `deliveredThreadKey(channel, thread_ts ?? ts)` —
+   *  for threads that have already delivered an inbound message this
+   *  process, i.e. threads a HUMAN has "engaged" by mentioning the bot at
+   *  least once (ccsc-apj.1). On a `requireMention` channel, a human
+   *  message in an already-engaged thread is delivered WITHOUT a fresh
+   *  mention ("mention once, then converse"). Keyed by the SESSION thread
+   *  (`thread_ts ?? ts`), NOT the raw `thread_ts`, so a top-level mention
+   *  and its in-thread follow-ups resolve to the same slot — this is why it
+   *  is a distinct set from the outbound `deliveredThreads` (which is keyed
+   *  by raw `thread_ts` for the cross-thread leak guard). Peer bots
+   *  (`ev.bot_id`) are NEVER sticky — they must mention every message,
+   *  which keeps the loop/noise risk bounded (the peer-bot rate limiter is
+   *  the backstop). Absent (tests / no wiring) → no thread is engaged, so
+   *  `requireMention` behaves exactly as before. */
+  engagedThreads?: ReadonlySet<string>
 }
 
 /**
@@ -1179,7 +1759,7 @@ function handleBotEvent(ev: Record<string, unknown>, opts: GateOptions): GateRes
     (opts.selfBotId && ev.bot_id === opts.selfBotId) ||
     (opts.selfAppId && botProfile.app_id === opts.selfAppId) ||
     (ev.user && ev.user === opts.botUserId)
-  if (isSelfEcho) return { action: 'drop' }
+  if (isSelfEcho) return { action: 'drop', dropReason: 'self.echo' }
 
   // Per-channel opt-in: only deliver if the channel explicitly lists this
   // bot's user ID in allowBotIds. No allowBotIds = all bots dropped.
@@ -1187,7 +1767,7 @@ function handleBotEvent(ev: Record<string, unknown>, opts: GateOptions): GateRes
   const policy = opts.access.channels[channel]
   const botUser = ev.user as string | undefined
   if (!policy?.allowBotIds?.length || !botUser || !policy.allowBotIds.includes(botUser)) {
-    return { action: 'drop' }
+    return { action: 'drop', dropReason: 'bot.not_allowlisted' }
   }
 
   // ccsc-gjm — operator-initiated mute. Check the mute store BEFORE
@@ -1225,12 +1805,28 @@ function handleBotEvent(ev: Record<string, unknown>, opts: GateOptions): GateRes
     }
   }
 
+  // ccsc-0k7x2 — channel-wide circuit breaker for N-cycle (A→B→C→A) rings.
+  // The per-(channel, bot) check above only breaks PAIRWISE loops; a 3+-bot
+  // ring keeps each sender under its own cap, so it slips through. This
+  // aggregate counter trips the whole channel's peer-bot traffic when total
+  // velocity is runaway-high. Default-on at DEFAULT_CHANNEL_CIRCUIT_BREAKER
+  // (40 msgs in 60s); { count: 0, windowMs: 0 } disables.
+  if (opts.peerBotRateLimitStore !== undefined) {
+    const breaker = policy.channelCircuitBreaker ?? DEFAULT_CHANNEL_CIRCUIT_BREAKER
+    if (breaker.count > 0 && breaker.windowMs > 0) {
+      const now = opts.now !== undefined ? opts.now() : Date.now()
+      if (!opts.peerBotRateLimitStore.checkChannel(channel, now, breaker)) {
+        return { action: 'drop', dropReason: 'rate.channel_cycle' }
+      }
+    }
+  }
+
   // Belt-and-suspenders: drop peer-bot messages that look like permission
   // relay replies. The global allowFrom check at server.ts already blocks
   // peer bots from approving tool calls, but this gate-level check prevents
   // regression if that guard is ever loosened.
   const text = ((ev.text as string) || '').trim()
-  if (PERMISSION_REPLY_RE.test(text)) return { action: 'drop' }
+  if (PERMISSION_REPLY_RE.test(text)) return { action: 'drop', dropReason: 'bot.permission_relay' }
 
   // Fall through to normal access-control checks (subtype, allowFrom,
   // requireMention). The channel policy's allowFrom and requireMention
@@ -1250,7 +1846,7 @@ async function handleDmEvent(ev: Record<string, unknown>, opts: GateOptions): Pr
     return { action: 'deliver', access }
   }
   if (access.dmPolicy === 'allowlist' || access.dmPolicy === 'disabled') {
-    return { action: 'drop' }
+    return { action: 'drop', dropReason: 'dm.policy_closed' }
   }
 
   // Pairing mode — check if there's already a pending code for this user
@@ -1261,13 +1857,13 @@ async function handleDmEvent(ev: Record<string, unknown>, opts: GateOptions): Pr
         if (!staticMode) saveAccess(access)
         return { action: 'pair', code, isResend: true }
       }
-      return { action: 'drop' } // Hit reply cap
+      return { action: 'drop', dropReason: 'dm.pairing_cap' } // Hit reply cap
     }
   }
 
   // Cap total pending
   if (Object.keys(access.pending).length >= MAX_PENDING) {
-    return { action: 'drop' }
+    return { action: 'drop', dropReason: 'dm.pending_full' }
   }
 
   // Generate new pairing code
@@ -1291,14 +1887,29 @@ function handleChannelEvent(ev: Record<string, unknown>, opts: GateOptions): Gat
   const { access, botUserId } = opts
   const channel = ev.channel as string
   const policy = access.channels[channel]
-  if (!policy) return { action: 'drop' }
+  if (!policy) return { action: 'drop', dropReason: 'channel.not_opted' }
 
   if (policy.allowFrom.length > 0 && !policy.allowFrom.includes(ev.user as string)) {
-    return { action: 'drop' }
+    return { action: 'drop', dropReason: 'channel.allowfrom_miss' }
   }
 
   if (policy.requireMention && !isMentioned(ev, botUserId)) {
-    return { action: 'drop' }
+    // ccsc-apj.1 — thread-sticky engagement. Once a HUMAN has engaged a
+    // thread by mentioning the bot, subsequent human messages in that same
+    // thread are delivered without a fresh mention ("mention once, then
+    // converse"). The engaged set is keyed by the SESSION thread
+    // (thread_ts ?? ts) so a top-level mention (ts=T1) and its in-thread
+    // follow-ups (thread_ts=T1) resolve to the same slot. Peer bots
+    // (ev.bot_id) are NEVER sticky — they must mention every message, so
+    // the loop/noise risk stays bounded (the peer-bot rate limiter is the
+    // backstop). A mention is still required to OPEN a thread.
+    if (!ev.bot_id && opts.engagedThreads !== undefined) {
+      const threadTs = (ev.thread_ts as string | undefined) ?? (ev.ts as string | undefined)
+      if (opts.engagedThreads.has(deliveredThreadKey(channel, threadTs))) {
+        return { action: 'deliver', access }
+      }
+    }
+    return { action: 'drop', dropReason: 'channel.require_mention' }
   }
 
   return { action: 'deliver', access }
@@ -1314,10 +1925,12 @@ export async function gate(event: unknown, opts: GateOptions): Promise<GateResul
   }
 
   // 2. Drop non-message subtypes (message_changed, message_deleted, etc.)
-  if (ev.subtype && ev.subtype !== 'file_share') return { action: 'drop' }
+  if (ev.subtype && ev.subtype !== 'file_share') {
+    return { action: 'drop', dropReason: 'subtype.filtered' }
+  }
 
   // 3. No user ID = drop
-  if (!ev.user) return { action: 'drop' }
+  if (!ev.user) return { action: 'drop', dropReason: 'event.no_user' }
 
   // 4. DM handling
   if (ev.channel_type === 'im') return handleDmEvent(ev, opts)
@@ -1326,8 +1939,53 @@ export async function gate(event: unknown, opts: GateOptions): Promise<GateResul
   return handleChannelEvent(ev, opts)
 }
 
+/** True when `botUserId` is mentioned in a way that should ENGAGE the bot
+ *  (ccsc-apj.4). Prefers Slack's structured `blocks`: a real mention is a
+ *  `user` element whose `user_id` is the bot, sitting in a normal
+ *  rich-text section/list — NOT inside a code block
+ *  (`rich_text_preformatted`) or a blockquote (`rich_text_quote`), where a
+ *  `<@bot>` is being quoted/displayed, not addressed. When `blocks` are
+ *  present they are authoritative (no substring fallback) so a mention
+ *  buried in a code block cannot falsely engage on a requireMention
+ *  channel. When `blocks` are absent (minimal events), fall back to the
+ *  legacy raw-text substring check. */
+function richTextMentionsBot(blocks: unknown, botUserId: string): boolean {
+  // Recursive walk over the rich-text tree. A `user` node addressing the bot
+  // counts UNLESS it sits inside a code block (`rich_text_preformatted`) or a
+  // blockquote (`rich_text_quote`) — those subtrees are pruned so a quoted
+  // `<@bot>` cannot engage. Handles arbitrary nesting (sections, lists).
+  const walk = (node: unknown): boolean => {
+    if (Array.isArray(node)) {
+      for (const n of node) if (walk(n)) return true
+      return false
+    }
+    if (!node || typeof node !== 'object') return false
+    const o = node as Record<string, unknown>
+    if (o.type === 'user' && o.user_id === botUserId) return true
+    if (o.type === 'rich_text_preformatted' || o.type === 'rich_text_quote') return false
+    return walk(o.elements)
+  }
+  return walk(blocks)
+}
+
 function isMentioned(event: Record<string, unknown>, botUserId: string): boolean {
   if (!botUserId) return false
+  // The structured path is authoritative ONLY when the message actually carries
+  // a `rich_text` block — that is where Slack encodes code/quote containers, so
+  // we can distinguish an addressed mention from a quoted one and must NOT fall
+  // back to substring (which would re-match a `<@bot>` inside a code block).
+  // Messages with only LAYOUT blocks (Block Kit `section`/`context`, common for
+  // bots/integrations posting via the API) carry no rich_text, so they fall
+  // through to the substring check — otherwise a real peer-bot mention would be
+  // missed and multi-agent coordination (`allowBotIds`) would break.
+  const blocks = event.blocks
+  if (
+    Array.isArray(blocks) &&
+    blocks.some((b) => (b as Record<string, unknown> | null)?.type === 'rich_text')
+  ) {
+    return richTextMentionsBot(blocks, botUserId)
+  }
+  // Fallback: no blocks, or layout-only blocks → legacy raw-text substring check.
   const text = (event.text as string | undefined) || ''
   return text.includes(`<@${botUserId}>`)
 }

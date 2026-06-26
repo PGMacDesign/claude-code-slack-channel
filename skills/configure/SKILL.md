@@ -3,7 +3,7 @@ name: configure
 description: Configure Slack channel tokens (bot token + app-level token)
 version: 1.0.0
 author: Jeremy Longshore <jeremy@intentsolutions.io>
-license: MIT
+license: Apache-2.0
 user-invocable: true
 argument-hint: "<bot-token> <app-token>"
 allowed-tools: [Read, Write, "Bash(cmd:chmod)"]
@@ -59,6 +59,10 @@ Configure the Slack channel with your bot token and app-level token.
 
    Or for development:
      claude --dangerously-load-development-channels server:slack
+
+   Next: opt in a channel and pick its interaction mode with
+   /slack-channel:access channel <id>  (defaults to mention-to-engage;
+   pass --ambient for a dedicated bot channel). See ACCESS.md "Interaction modes".
    ```
 
 ## Security

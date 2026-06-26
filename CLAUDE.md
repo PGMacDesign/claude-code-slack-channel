@@ -23,20 +23,34 @@ When in doubt, stop and ask. "Do you want me to push?" is always the right move 
 
 Slack channel for the Claude Code — two-way chat bridge via Socket Mode + MCP stdio.
 
+> **`AGENTS.md` is the cross-tool sibling of this file.** Top-level `AGENTS.md` follows the open [agents.md](https://agents.md) spec and is the instruction surface read by non-Claude assistants (Codex CLI, Cursor, Cline, Gemini CLI, Copilot, etc.). This `CLAUDE.md` is the Claude-Code-specific layer. When a fact in one (architecture, security model, gates) changes, update both — they must not drift.
+
 ## Architecture
 
-Six production source files (Bun/TypeScript, strict mode):
+Bun/TypeScript, strict mode. ~17 production source files (LoC drifts every commit — run `wc -l *.ts` for current). The load-bearing core:
 
-| File | LoC | Purpose |
+| File | ~LoC | Purpose |
 |---|---|---|
-| `server.ts` | 2810 | Stateful runtime — Slack client bootstrap, MCP server, event handlers |
-| `lib.ts` | 1793 | Pure functions — `gate()`, `assertSendable()`, `assertOutboundAllowed()`, session types, audit-receipt helpers |
-| `journal.ts` | 1145 | Hash-chained audit log — `JournalWriter`, `verifyJournal`, redactor (Epic 30-A) |
-| `supervisor.ts` | 980 | `SessionSupervisor` — activate / deactivate / quiesce, idle reaper, quarantine (Epic 32) |
-| `policy.ts` | 647 | Declarative policy engine — `evaluate()`, `detectShadowing`, `checkMonotonicity` (Epic 29) |
+| `server.ts` | 3518 | Stateful runtime — Slack client bootstrap, MCP server, event handlers, file I/O |
+| `lib.ts` | 2369 | Pure functions — `gate()`, `assertSendable()`, `assertOutboundAllowed()`, session types, audit-receipt + idempotent-send helpers |
+| `supervisor.ts` | 1721 | `SessionSupervisor` — activate / deactivate / quiesce, idle reaper, quarantine (Epic 32), outbox drain (`drainOutbox`, ccsc-o7x) |
+| `journal.ts` | 1458 | Hash-chained audit log — `JournalWriter`, `verifyJournal`, redactor (Epic 30-A) |
+| `policy.ts` | 818 | Declarative policy engine — `evaluate()`, `detectShadowing`, `checkMonotonicity` (Epic 29) |
 | `manifest.ts` | 573 | Bot-manifest protocol — schema, publish-side validation, subset check (Epic 31) |
 
-Four runtime dependencies: `@modelcontextprotocol/sdk`, `@slack/web-api`, `@slack/socket-mode`, `zod`. No frameworks.
+Supporting modules (epic-scoped; each file header carries its `ccsc-*` bead tag):
+
+| File(s) | Purpose |
+|---|---|
+| `crypto.ts` · `audit-key-loader.ts` · `audit-key-cli.ts` | Ed25519 audit-event signing over RFC 8785 JCS + keypair load/CLI (journal v2) |
+| `admin.ts` · `mute-store.ts` · `nonce-hitl.ts` | Operator admin command dispatcher, peer-bot mute store, HMAC-nonce cross-channel HITL approval |
+| `policy-dispatch.ts` | Side-effect-free dispatcher routing a gated call through `evaluate()` to allow/deny/require |
+| `peer-bot-rate-limit.ts` | Per-(channel, bot_id) sliding-window limit breaking A→B→A runaway loops |
+| `stream-reply.ts` | Progressive Slack reply via `chat.update` |
+| `acp-adapter.ts` | Agent Client Protocol (ACP) stdio boundary adapter |
+| `slack-delivery.ts` | Thin Slack-`WebClient` adapter for the crash-safe reply-delivery outbox (ccsc-o7x): `findDelivered` / `post` with the idempotency key stamped into message metadata. Kept a sibling of `server.ts` so it can be unit-tested against a faked client without triggering server module-load side effects; the idempotent-send logic itself lives in `lib.ts` (`makeIdempotentSend`, `deliveryIdempotencyKey`). |
+
+Runtime dependencies: `@modelcontextprotocol/sdk`, `@slack/web-api`, `@slack/socket-mode`, `zod`, `tsx`. No frameworks.
 
 ```
 Slack workspace → Socket Mode WebSocket → server.ts → MCP stdio → Claude Code
@@ -46,7 +60,7 @@ Slack workspace → Socket Mode WebSocket → server.ts → MCP stdio → Claude
 
 **`server.ts`** handles stateful concerns: Slack client bootstrap, token loading, MCP server registration, event listeners, file I/O.
 
-**`policy.ts`, `manifest.ts`, `journal.ts`, `supervisor.ts`** are epic-scoped modules with their own design docs (see below). 31-A.4 invariant: `server.ts` does not import `manifest.ts` directly — enforced by both `.dependency-cruiser.js` and a compile-time import-graph test in `server.test.ts`.
+**`policy.ts`, `manifest.ts`, `journal.ts`, `supervisor.ts`** are epic-scoped modules with their own design docs (see below). **31-A.4 isolation invariant**: `policy.ts` (and `admin.ts`) must NEVER import `manifest.ts` — the manifest module is advertising-only, the policy engine is authoritative, so "advertisements are not grants." Enforced by `.dependency-cruiser.js` (`no-policy-imports-manifest`, `no-admin-imports-manifest`) plus a compile-time import-graph test in `server.test.ts`. (`server.ts` itself *does* import `manifest.ts` to wire the `publish_manifest` tool — that's allowed; the ban is specifically policy/admin → manifest.)
 
 ## Commands
 
@@ -55,12 +69,12 @@ Slack workspace → Socket Mode WebSocket → server.ts → MCP stdio → Claude
 ```bash
 bun install                              # Install deps
 bun run typecheck                        # TypeScript strict check (tsc --noEmit)
-bun test                                 # Run test suite (bun:test) — 704 tests
+bun test                                 # Run test suite (bun:test) — ~1,033 tests
 bun test --timeout 15000                 # Match CI's timeout
 bun test --watch                         # Watch mode
 bun test --test-name-pattern "gate"      # Run tests matching a pattern
 bun test server.test.ts                  # Just the unit suite (skip Gherkin runner)
-bun test features/runner.test.ts         # Just the Gherkin scenarios (37 tests)
+bun test features/runner.test.ts         # Just the Gherkin scenarios (61 across 7 .feature files)
 bun server.ts                            # Run server directly
 npx tsx server.ts                        # Node.js fallback
 ```
@@ -89,6 +103,15 @@ bunx stryker run                         # lib+policy+manifest+journal; see 000-
 ```bash
 claude --dangerously-load-development-channels server:slack
 ```
+
+### Local git hooks (husky — run before code reaches CI)
+
+Husky owns `core.hooksPath`; hooks live in `.husky/` (not `.git/hooks/`). Both wrap a beads-integration block (`bd hooks run`, soft-fails on timeout/uninit) ahead of the quality gate:
+
+- `.husky/pre-commit` — runs `bunx lint-staged` → Biome `check --write` on staged `*.{ts,js,json}` only (fast, per-file).
+- `.husky/pre-push` — runs `bun run typecheck` (cross-file guarantee that lint-staged's per-file pass can't give).
+
+`bun run prepare` (husky) installs them on `bun install`. Both are intentionally lighter than CI — the full nine-gate chain runs server-side on push.
 
 ### CI workflows (`.github/workflows/`)
 
@@ -127,9 +150,10 @@ echo '{"strict":true, "contexts":["Typecheck"]}' | gh api -X PATCH repos/jeremyl
 - `manifest.ts` — bot-manifest protocol (Epic 31): schema, `assertPublishAllowed`, `validateManifestSubset`
 
 ### Tests & acceptance contracts
-- `server.test.ts` — primary test suite covering security-critical functions (uses `bun:test`). Total across all three test files (plus `features/gate-properties.test.ts` and `features/runner.test.ts`) is **~704 tests / ~4,035 expects** (a moving snapshot — exact count drifts with every feature commit; soft floor lives in coverage, not test count). Run a subset with `bun test --test-name-pattern "<pattern>"`.
-- `features/*.feature` — Wall 1 acceptance contracts (engineer-owned, pinned by `.harness-hash`); five primitives: `inbound_gate`, `file_exfiltration_guard`, `outbound_reply_filter`, `policy_evaluation`, `audit_chain_verifier`
-- `features/runner.ts` + `features/runner.test.ts` + `features/steps/*.ts` — hand-rolled Gherkin runner executing all 37 scenarios against the real primitives
+- `server.test.ts` — primary test suite covering security-critical functions (uses `bun:test`). Total across all four test files (`server.test.ts` + `features/gate-properties.test.ts` + `features/jcs-interop.test.ts` + `features/runner.test.ts`) is **~1,033 `it`/`test` blocks** (`grep -cE "^\s*(it|test)\(" server.test.ts features/*.test.ts`; `features/runner.test.ts` adds the 61 Gherkin scenarios through a hand-rolled runner rather than `it()` blocks). A moving snapshot — exact count drifts with every feature commit; the soft floor lives in coverage, not test count. Run a subset with `bun test --test-name-pattern "<pattern>"`.
+- `features/*.feature` — Wall 1 acceptance contracts (engineer-owned, pinned by `.harness-hash`); seven primitives: `inbound_gate`, `file_exfiltration_guard`, `outbound_reply_filter`, `policy_evaluation`, `audit_chain_verifier`, `admin_commands`, `tier-shadow`
+- `features/runner.ts` + `features/runner.test.ts` + `features/steps/*.ts` — hand-rolled Gherkin runner executing all 61 scenarios against the real primitives
+- `features/gate-properties.test.ts` — fast-check property-based tests for `gate()`; `features/jcs-interop.test.ts` — RFC 8785 JCS canonicalization interop for audit signing
 
 ### Config
 - `biome.json` — Biome lint config (curated rule set, formatter off, `recommended: false`)
@@ -146,11 +170,13 @@ echo '{"strict":true, "contexts":["Typecheck"]}' | gh api -X PATCH repos/jeremyl
 - `scripts/harness-hash.sh` — tamper-detect pinned artifacts (mirrored from skill)
 - `scripts/bias-count.sh` — test-bias pattern scanner (mirrored from skill with pipefail fix)
 - `scripts/policy-validate.ts` — CLI wrapper around `parsePolicyRules` + `detectShadowing` + `detectBroadAutoApprove` used by `/slack-channel:policy`
+- `scripts/audit-key.ts` — production runner for the audit-key CLI (`audit-key-cli.ts`): `init` / `rotate` / `help` for the Ed25519 journal-signing keypair (journal v2)
 
 ### Skills & docs
 - `skills/configure/SKILL.md` — `/slack-channel:configure` token setup skill
 - `skills/access/SKILL.md` — `/slack-channel:access` pairing/allowlist management skill
 - `skills/policy/SKILL.md` — `/slack-channel:policy` policy-rule authoring skill (validates via `scripts/policy-validate.ts`)
+- `skills/install/SKILL.md` — `/slack-channel:install` multi-mode install skill (plugin / dev / Docker)
 - `ACCESS.md` — access control schema documentation
 - `CHANGELOG.md` — Keep a Changelog format; every user-visible change lands with a PR entry
 
@@ -169,7 +195,7 @@ The design-in-public commitment: the doc ships before the code, and the doc is t
 ### Audit + quality-gate reports (snapshots — diff against on next audit)
 - `000-docs/TEST_AUDIT.md` — Seven Walls scorecard, suite metrics, bias audit (produced by `/audit-tests`).
 - `000-docs/QUALITY_GATES.md` — Step 5.5 gate-sweep matrix: one row per quality-gate category, current state, CI wiring.
-- `000-docs/MUTATION_REPORT.md` — Stryker baselines per file. Current: `journal.ts` 87.76% / `lib.ts` 84.78% / `manifest.ts` 92.06% / `policy.ts` 78.00% / All 85.22%.
+- `000-docs/MUTATION_REPORT.md` — Stryker baselines per file. Current: `journal.ts` 85.26% / `lib.ts` 85.01% / `manifest.ts` 92.02% / `policy.ts` 89.78% / All 86.72% (post-`ccsc-2et`, CI run 26730834576).
 - `000-docs/AUTO_REMEDIATION_REPORT.md` — Step 8 gap analysis (no-op on this suite; rubric-driven remediation would add nothing today).
 
 When a design doc and code disagree, the code is wrong. When an audit report and current state disagree, the code is right and the report is stale — file a bd for the refresh.
@@ -190,7 +216,7 @@ Any change to `gate()`, `assertSendable()`, or `assertOutboundAllowed()` is secu
 
 Two distinct surfaces, often confused:
 
-- **Authoritative log** (Epic 30-A) — `~/.claude/channels/slack/audit.log`. Hash-chained, tamper-evident, redacted per fixed rules. Every tool-call decision (`policy.allow` / `policy.deny` / `policy.require` / `policy.approved`) is written here regardless of any Slack state. Verify with `bun server.ts --verify-audit-log <path>`. This is the record.
+- **Authoritative log** (Epic 30-A) — `~/.claude/channels/slack/audit.log`. Hash-chained, Ed25519-signed, redacted per fixed rules. Every tool-call decision (`policy.allow` / `policy.deny` / `policy.require` / `policy.approved`) is written here regardless of any Slack state. Verify with `bun server.ts --verify-audit-log <path>`. This is the record.
 
 - **Projection** (Epic 30-B) — best-effort Slack-thread mirror of selected journal events. Controlled per-channel via `ChannelPolicy.audit` (`'off'` | `'compact'` | `'full'`). Posts receipts into the originating thread so operators can see what Claude is doing without leaving Slack. **Not** authoritative: Slack API errors, rate limits, missing messages, or lost events in the stream all mean a projected event may never appear. Operators who need ground truth read the local log.
 
