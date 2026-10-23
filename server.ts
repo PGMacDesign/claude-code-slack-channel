@@ -27,6 +27,16 @@ import { WebClient } from '@slack/web-api'
 import { z } from 'zod'
 import { createTmuxSendKeys, dispatchAdminCommand, parseAdminCommand } from './admin.ts'
 import { loadSigningKey, parseNoAuditSigningFlag } from './audit-key-loader.ts'
+import {
+  buildActionMessageBlocks,
+  handleActClick,
+  isActAction,
+  MAX_ACTION_TEXT,
+  MAX_BUTTON_LABEL,
+  MAX_BUTTON_VALUE,
+  MAX_BUTTONS,
+  SendActionsInput,
+} from './button-actions.ts'
 import { createBootAnchor, JournalWriter, verifyJournal } from './journal.ts'
 import {
   type Access,
@@ -955,6 +965,7 @@ const PublishManifestInput = z
 // If you update a schema here, please update the corresponding copy there.
 export const toolSchemas = {
   reply: ReplyInput,
+  send_actions: SendActionsInput,
   react: ReactInput,
   edit_message: EditMessageInput,
   fetch_messages: FetchMessagesInput,
@@ -996,6 +1007,45 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['chat_id', 'text'],
+      },
+    },
+    {
+      name: 'send_actions',
+      description:
+        'Post one message with up to 5 buttons. A click on a button comes back as a channel message "[button] <label>" from the clicking user, with the button value in meta.action_value; each button works once, and only for allowlisted users.',
+      inputSchema: {
+        type: 'object' as const,
+        properties: {
+          chat_id: { type: 'string', description: 'Slack channel or DM ID' },
+          text: {
+            type: 'string',
+            description: `Message text, mrkdwn, at most ${MAX_ACTION_TEXT} characters`,
+          },
+          thread_ts: {
+            type: 'string',
+            description: 'Thread timestamp to post in-thread (optional)',
+          },
+          buttons: {
+            type: 'array',
+            description: `1 to ${MAX_BUTTONS} buttons`,
+            items: {
+              type: 'object',
+              properties: {
+                label: {
+                  type: 'string',
+                  description: `Button text, at most ${MAX_BUTTON_LABEL} characters`,
+                },
+                value: {
+                  type: 'string',
+                  description: `Returned to you on click, at most ${MAX_BUTTON_VALUE} characters`,
+                },
+                style: { type: 'string', enum: ['primary', 'danger'] },
+              },
+              required: ['label', 'value'],
+            },
+          },
+        },
+        required: ['chat_id', 'text', 'buttons'],
       },
     },
     {
@@ -1683,6 +1733,62 @@ async function executeReply(args: Record<string, any>, ctx: ToolContext): Promis
 }
 
 // -----------------------------------------------------------------------
+// send_actions
+// -----------------------------------------------------------------------
+async function executeSendActions(
+  args: Record<string, any>,
+  ctx: ToolContext,
+): Promise<ToolResult> {
+  const chatId: string = args.chat_id
+  const threadTs: string | undefined = args.thread_ts
+  const buttons: Array<{ label: string; value: string; style?: 'primary' | 'danger' }> =
+    args.buttons
+  const sessionKey = threadTs !== undefined ? { channel: chatId, thread: threadTs } : undefined
+  try {
+    ctx.assertOutboundAllowed(chatId, threadTs)
+  } catch (outboundErr) {
+    ctx.journalWrite({
+      kind: 'gate.outbound.deny',
+      outcome: 'deny',
+      toolName: 'send_actions',
+      sessionKey,
+      input: { channel: chatId, thread_ts: threadTs },
+      reason: outboundErr instanceof Error ? outboundErr.message : String(outboundErr),
+    })
+    throw outboundErr
+  }
+  // Labels and values are posted to Slack too, so they get the same value guard as the text.
+  guardOutboundSecretValues(
+    [args.text, ...buttons.flatMap((b) => [b.label, b.value])].join('\n'),
+    'send_actions',
+    ctx,
+  )
+  ctx.journalWrite({
+    kind: 'gate.outbound.allow',
+    outcome: 'allow',
+    toolName: 'send_actions',
+    sessionKey,
+    input: { channel: chatId, thread_ts: threadTs },
+  })
+  const res = await ctx.web.chat.postMessage({
+    channel: chatId,
+    text: args.text,
+    thread_ts: threadTs,
+    blocks: buildActionMessageBlocks(args.text, buttons),
+    unfurl_links: false,
+    unfurl_media: false,
+  })
+  return {
+    content: [
+      {
+        type: 'text',
+        text: `Sent message with ${buttons.length} button(s) to ${chatId}${res.ts ? ` [ts: ${res.ts}]` : ''}`,
+      },
+    ],
+  }
+}
+
+// -----------------------------------------------------------------------
 // react
 // -----------------------------------------------------------------------
 async function executeReact(args: Record<string, any>, ctx: ToolContext): Promise<ToolResult> {
@@ -2303,6 +2409,7 @@ type ToolHandler = (args: Record<string, any>, ctx: ToolContext) => Promise<Tool
 
 const toolHandlers: Record<string, ToolHandler> = {
   reply: executeReply,
+  send_actions: executeSendActions,
   react: executeReact,
   edit_message: executeEditMessage,
   fetch_messages: executeFetchMessages,
@@ -2971,6 +3078,10 @@ async function handleAllowDenyAction(
 }
 
 // Handle Block Kit button interactions (delivered via Socket Mode)
+// Clicks already forwarded, keyed by channel, message ts and action id, so a
+// double click or a redelivered interaction reaches the session once.
+const forwardedActClicks = new Set<string>()
+
 socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<void> }) => {
   try {
     await ack()
@@ -2978,6 +3089,32 @@ socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<v
 
     const action = body.actions[0]
     const actionId: string = action.action_id || ''
+    if (isActAction(actionId)) {
+      await handleActClick(
+        {
+          allowFrom: () => getAccess().allowFrom,
+          forwarded: forwardedActClicks,
+          resolveUserName,
+          recordInbound: ({ channel, threadTs, userId }) => {
+            deliveredThreads.add(libDeliveredThreadKey(channel, threadTs))
+            lastActiveChannel = channel
+            lastActiveThread = threadTs
+            journalWrite({
+              kind: 'gate.inbound.deliver',
+              outcome: 'allow',
+              actor: 'session_owner',
+              input: { channel, user: userId, thread_ts: threadTs },
+              reason: 'button click',
+            })
+          },
+          notify: (params) => mcp.notification({ method: 'notifications/claude/channel', params }),
+          update: (args) => web.chat.update(args),
+          postEphemeral: (args) => web.chat.postEphemeral(args),
+        },
+        body,
+      )
+      return
+    }
     const match = actionId.match(/^perm:(allow|deny|more):(.+)$/)
     if (!match) {
       // Any button click outside the perm: namespace is an agent-authored
