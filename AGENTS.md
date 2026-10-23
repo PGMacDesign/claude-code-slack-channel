@@ -99,7 +99,7 @@ runs it inside Claude Code in dev mode (bypasses the plugin allowlist).
 | `admin.ts` | Admin command routing (gate → policy → journal → tmux) |
 | `slack-delivery.ts` | Outbound Slack delivery (chat.postMessage / chat.update) |
 | `stream-reply.ts` | Streaming `chat.update` reply with single-finalize |
-| `button-actions.ts` | `send_actions` buttons and their clicks: `act:` clicks from allowlisted users are forwarded to the session once each, then the clicked button is removed |
+| `button-actions.ts` | `send_actions` buttons and their clicks: `act:` clicks from allowlisted users are forwarded to the session once each, then the clicked button is removed; a button with a `prompt` opens a reply box and forwards the typed text on submit |
 | `audit-key-loader.ts` | SOPS-decryption + boot-time audit-key load |
 | `audit-key-cli.ts` | Operator CLI for audit-key init/rotate |
 | `mute-store.ts` | `!mute` / `!unmute` peer-bot state |

@@ -28,14 +28,20 @@ import { z } from 'zod'
 import { createTmuxSendKeys, dispatchAdminCommand, parseAdminCommand } from './admin.ts'
 import { loadSigningKey, parseNoAuditSigningFlag } from './audit-key-loader.ts'
 import {
+  type ActClickDeps,
   buildActionMessageBlocks,
+  type CachedMessage,
   handleActClick,
+  handleReplySubmission,
   isActAction,
   MAX_ACTION_TEXT,
   MAX_BUTTON_LABEL,
+  MAX_BUTTON_PROMPT,
   MAX_BUTTON_VALUE,
   MAX_BUTTONS,
+  REPLY_VIEW_CALLBACK,
   SendActionsInput,
+  sendActionsOutboundText,
 } from './button-actions.ts'
 import { createBootAnchor, JournalWriter, verifyJournal } from './journal.ts'
 import {
@@ -1012,7 +1018,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'send_actions',
       description:
-        'Post one message with up to 5 buttons. A click on a button comes back as a channel message "[button] <label>" from the clicking user, with the button value in meta.action_value; each button works once, and only for allowlisted users.',
+        'Post one message with up to 5 buttons. A click on a button comes back as a channel message "[button] <label>" from the clicking user, with the button value in meta.action_value; each button works once, and only for allowlisted users. A button with a prompt opens a reply box instead: the typed text comes back after the label ("[button] <label>", a blank line, then the text) and in meta.reply_text, and the button is used up only when the reply is sent.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -1040,6 +1046,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
                   description: `Returned to you on click, at most ${MAX_BUTTON_VALUE} characters`,
                 },
                 style: { type: 'string', enum: ['primary', 'danger'] },
+                prompt: {
+                  type: 'string',
+                  description: `Optional. Makes the button open a reply box with this question as its label, at most ${MAX_BUTTON_PROMPT} characters`,
+                },
               },
               required: ['label', 'value'],
             },
@@ -1741,8 +1751,12 @@ async function executeSendActions(
 ): Promise<ToolResult> {
   const chatId: string = args.chat_id
   const threadTs: string | undefined = args.thread_ts
-  const buttons: Array<{ label: string; value: string; style?: 'primary' | 'danger' }> =
-    args.buttons
+  const buttons: Array<{
+    label: string
+    value: string
+    style?: 'primary' | 'danger'
+    prompt?: string
+  }> = args.buttons
   const sessionKey = threadTs !== undefined ? { channel: chatId, thread: threadTs } : undefined
   try {
     ctx.assertOutboundAllowed(chatId, threadTs)
@@ -1757,9 +1771,9 @@ async function executeSendActions(
     })
     throw outboundErr
   }
-  // Labels and values are posted to Slack too, so they get the same value guard as the text.
+  // Labels, values and prompts are posted to Slack too, so they get the same value guard as the text.
   guardOutboundSecretValues(
-    [args.text, ...buttons.flatMap((b) => [b.label, b.value])].join('\n'),
+    sendActionsOutboundText({ text: args.text, buttons }),
     'send_actions',
     ctx,
   )
@@ -3081,38 +3095,46 @@ async function handleAllowDenyAction(
 // Clicks already forwarded, keyed by channel, message ts and action id, so a
 // double click or a redelivered interaction reaches the session once.
 const forwardedActClicks = new Set<string>()
+// Messages with an open reply box, so the reply can update them.
+const replyBoxMessages = new Map<string, CachedMessage>()
+const actDeps: ActClickDeps = {
+  allowFrom: () => getAccess().allowFrom,
+  forwarded: forwardedActClicks,
+  resolveUserName: (userId) => resolveUserName(userId),
+  recordInbound: ({ channel, threadTs, userId, reason }) => {
+    deliveredThreads.add(libDeliveredThreadKey(channel, threadTs))
+    lastActiveChannel = channel
+    lastActiveThread = threadTs
+    journalWrite({
+      kind: 'gate.inbound.deliver',
+      outcome: 'allow',
+      actor: 'session_owner',
+      input: { channel, user: userId, thread_ts: threadTs },
+      reason,
+    })
+  },
+  notify: (params) => mcp.notification({ method: 'notifications/claude/channel', params }),
+  update: (args) => web.chat.update(args),
+  postEphemeral: (args) => web.chat.postEphemeral(args),
+  // The modal is built as plain Block Kit JSON in button-actions.ts, not as the SDK's View union.
+  openView: (args) => web.views.open(args as Parameters<typeof web.views.open>[0]),
+  replyCache: replyBoxMessages,
+}
 
 socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<void> }) => {
   try {
+    // An empty ack also closes a submitted reply box.
     await ack()
+    if (body?.type === 'view_submission' && body.view?.callback_id === REPLY_VIEW_CALLBACK) {
+      await handleReplySubmission(actDeps, body)
+      return
+    }
     if (body?.type !== 'block_actions' || !body.actions?.length) return
 
     const action = body.actions[0]
     const actionId: string = action.action_id || ''
     if (isActAction(actionId)) {
-      await handleActClick(
-        {
-          allowFrom: () => getAccess().allowFrom,
-          forwarded: forwardedActClicks,
-          resolveUserName,
-          recordInbound: ({ channel, threadTs, userId }) => {
-            deliveredThreads.add(libDeliveredThreadKey(channel, threadTs))
-            lastActiveChannel = channel
-            lastActiveThread = threadTs
-            journalWrite({
-              kind: 'gate.inbound.deliver',
-              outcome: 'allow',
-              actor: 'session_owner',
-              input: { channel, user: userId, thread_ts: threadTs },
-              reason: 'button click',
-            })
-          },
-          notify: (params) => mcp.notification({ method: 'notifications/claude/channel', params }),
-          update: (args) => web.chat.update(args),
-          postEphemeral: (args) => web.chat.postEphemeral(args),
-        },
-        body,
-      )
+      await handleActClick(actDeps, body)
       return
     }
     const match = actionId.match(/^perm:(allow|deny|more):(.+)$/)

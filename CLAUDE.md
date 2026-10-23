@@ -30,7 +30,7 @@ Supporting modules (epic-scoped; each file header carries its `ccsc-*` bead tag)
 | `policy-dispatch.ts` | Side-effect-free dispatcher routing a gated call through `evaluate()` to allow/deny/require |
 | `peer-bot-rate-limit.ts` | Per-(channel, bot_id) sliding-window limit breaking A→B→A runaway loops |
 | `stream-reply.ts` | Progressive Slack reply via `chat.update` |
-| `button-actions.ts` | `send_actions` buttons and their clicks: `act:` clicks from allowlisted users are forwarded to the session once each, then the clicked button is removed |
+| `button-actions.ts` | `send_actions` buttons and their clicks: `act:` clicks from allowlisted users are forwarded to the session once each, then the clicked button is removed; a button with a `prompt` opens a reply box and forwards the typed text on submit |
 | `acp-adapter.ts` | Agent Client Protocol (ACP) stdio boundary adapter |
 | `slack-delivery.ts` | Slack-`WebClient` adapter (~738 LoC) for the crash-safe reply-delivery outbox (ccsc-o7x): `findDelivered` / `post` with the idempotency key stamped into message metadata. Kept a sibling of `server.ts` so it can be unit-tested against a faked client without triggering server module-load side effects; the idempotent-send logic itself lives in `lib.ts` (`makeIdempotentSend`, `deliveryIdempotencyKey`). |
 
