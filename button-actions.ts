@@ -82,11 +82,14 @@ export const SendActionsInput = z
 
 /** Everything `send_actions` posts to Slack, for the outbound secret guard:
  *  the text, and every label, value and prompt. */
-export function sendActionsOutboundText(args: { text: string; buttons: readonly ActionButton[] }): string {
+export function sendActionsOutboundText(args: {
+  text: string
+  buttons: readonly ActionButton[]
+}): string {
   return [args.text, ...args.buttons.flatMap((b) => [b.label, b.value, b.prompt ?? ''])].join('\n')
 }
 
-// biome-ignore lint/suspicious/noExplicitAny: Slack Block Kit blocks are open-ended JSON
+// any: Slack Block Kit blocks are open-ended JSON
 type Block = { type: string; [key: string]: any }
 
 export function isActAction(actionId: string): boolean {
@@ -100,11 +103,15 @@ function isPromptAction(actionId: string): boolean {
 /** The button's value and, for a reply-box button, its prompt. Null when a
  *  reply-box button's envelope is unreadable, which only a message the bridge
  *  did not build could carry. */
-function decodeButtonValue(actionId: string, raw: string): { value: string; prompt?: string } | null {
+function decodeButtonValue(
+  actionId: string,
+  raw: string,
+): { value: string; prompt?: string } | null {
   if (!isPromptAction(actionId)) return { value: raw }
   try {
     const parsed = JSON.parse(raw)
-    if (typeof parsed?.v === 'string' && typeof parsed?.p === 'string') return { value: parsed.v, prompt: parsed.p }
+    if (typeof parsed?.v === 'string' && typeof parsed?.p === 'string')
+      return { value: parsed.v, prompt: parsed.p }
   } catch {
     /* fall through */
   }
@@ -179,7 +186,13 @@ export interface ActClickDeps {
   replyCache: Map<string, CachedMessage>
 }
 
-export type ActClickOutcome = 'ignored' | 'refused' | 'duplicate' | 'forwarded' | 'opened' | 'failed'
+export type ActClickOutcome =
+  | 'ignored'
+  | 'refused'
+  | 'duplicate'
+  | 'forwarded'
+  | 'opened'
+  | 'failed'
 
 const SLACK_ID = /^[A-Z0-9]{1,32}$/
 
@@ -196,7 +209,8 @@ export interface ButtonRoute {
   threadTs: string | undefined
 }
 
-const keyOf = (channel: string, messageTs: string, actionId: string) => `${channel}:${messageTs}:${actionId}`
+const keyOf = (channel: string, messageTs: string, actionId: string) =>
+  `${channel}:${messageTs}:${actionId}`
 const routeKey = (r: ButtonRoute) => keyOf(r.channel, r.messageTs, r.actionId)
 const spentOn = (deps: ActClickDeps, r: ButtonRoute) => (id: string) =>
   deps.forwarded.has(keyOf(r.channel, r.messageTs, id))
@@ -211,7 +225,12 @@ function spend(forwarded: Set<string>, key: string): void {
   }
 }
 
-async function tellUser(deps: ActClickDeps, channel: string, user: string, text: string): Promise<void> {
+async function tellUser(
+  deps: ActClickDeps,
+  channel: string,
+  user: string,
+  text: string,
+): Promise<void> {
   try {
     await deps.postEphemeral({ channel, user, text })
   } catch {
@@ -225,7 +244,7 @@ async function tellUser(deps: ActClickDeps, channel: string, user: string, text:
  *  concurrent duplicate sees it), then notify, then the message update, which
  *  is best-effort so a Slack error can never swallow the click. A reply-box
  *  button opens its box instead and is spent only when the reply is sent. */
-// biome-ignore lint/suspicious/noExplicitAny: interaction payloads are untyped JSON from Slack
+// any: interaction payloads are untyped JSON from Slack
 export async function handleActClick(deps: ActClickDeps, body: any): Promise<ActClickOutcome> {
   const action = body?.actions?.[0]
   const actionId: string = action?.action_id ?? ''
@@ -233,7 +252,8 @@ export async function handleActClick(deps: ActClickDeps, body: any): Promise<Act
   const messageTs: string = body?.message?.ts ?? ''
   const userId: string = body?.user?.id ?? ''
   const decoded = decodeButtonValue(actionId, String(action?.value ?? ''))
-  if (!isActAction(actionId) || !channel || !messageTs || !SLACK_ID.test(userId) || !decoded) return 'ignored'
+  if (!isActAction(actionId) || !channel || !messageTs || !SLACK_ID.test(userId) || !decoded)
+    return 'ignored'
 
   if (!deps.allowFrom().includes(userId)) {
     await tellUser(deps, channel, userId, 'Only the session owner can use these buttons.')
@@ -248,7 +268,10 @@ export async function handleActClick(deps: ActClickDeps, body: any): Promise<Act
     value: decoded.value.slice(0, MAX_BUTTON_VALUE),
     threadTs: body?.message?.thread_ts || undefined,
   }
-  const message: CachedMessage = { text: body?.message?.text ?? '', blocks: body?.message?.blocks ?? [] }
+  const message: CachedMessage = {
+    text: body?.message?.text ?? '',
+    blocks: body?.message?.blocks ?? [],
+  }
   const key = routeKey(route)
   if (deps.forwarded.has(key)) {
     // Spent already. Say so, since the button may still be on screen if an
@@ -258,7 +281,14 @@ export async function handleActClick(deps: ActClickDeps, body: any): Promise<Act
     return 'duplicate'
   }
   if (decoded.prompt !== undefined) {
-    return openReplyBox(deps, String(body?.trigger_id ?? ''), route, decoded.prompt, message, userId)
+    return openReplyBox(
+      deps,
+      String(body?.trigger_id ?? ''),
+      route,
+      decoded.prompt,
+      message,
+      userId,
+    )
   }
 
   spend(deps.forwarded, key)
@@ -281,7 +311,12 @@ async function openReplyBox(
   try {
     await deps.openView({ trigger_id: triggerId, view: buildReplyView(route, prompt) })
   } catch {
-    await tellUser(deps, route.channel, userId, 'Could not open the reply box. Click the button again.')
+    await tellUser(
+      deps,
+      route.channel,
+      userId,
+      'Could not open the reply box. Click the button again.',
+    )
     return 'failed'
   }
   const key = routeKey(route)
@@ -307,7 +342,12 @@ export function buildReplyView(route: ButtonRoute, prompt: string): Block {
         type: 'input',
         block_id: REPLY_BLOCK,
         label: { type: 'plain_text', text: prompt },
-        element: { type: 'plain_text_input', action_id: REPLY_INPUT, multiline: true, max_length: MAX_REPLY_TEXT },
+        element: {
+          type: 'plain_text_input',
+          action_id: REPLY_INPUT,
+          multiline: true,
+          max_length: MAX_REPLY_TEXT,
+        },
       },
     ],
   }
@@ -361,10 +401,14 @@ function decodeReplyMetadata(raw: unknown): ButtonRoute | null {
  *  acknowledged it, which closes the box. Same order as a click: owner check,
  *  synchronous spend, notify (un-spending on failure), then a best-effort
  *  update of the original message, skipped when its snapshot is gone. */
-// biome-ignore lint/suspicious/noExplicitAny: interaction payloads are untyped JSON from Slack
-export async function handleReplySubmission(deps: ActClickDeps, body: any): Promise<ActClickOutcome> {
+// any: interaction payloads are untyped JSON from Slack
+export async function handleReplySubmission(
+  deps: ActClickDeps,
+  body: any,
+): Promise<ActClickOutcome> {
   const view = body?.view
-  const route = view?.callback_id === REPLY_VIEW_CALLBACK ? decodeReplyMetadata(view?.private_metadata) : null
+  const route =
+    view?.callback_id === REPLY_VIEW_CALLBACK ? decodeReplyMetadata(view?.private_metadata) : null
   const userId: string = body?.user?.id ?? ''
   const raw = view?.state?.values?.[REPLY_BLOCK]?.[REPLY_INPUT]?.value
   const text = typeof raw === 'string' ? raw.slice(0, MAX_REPLY_TEXT) : ''
@@ -389,7 +433,12 @@ export async function handleReplySubmission(deps: ActClickDeps, body: any): Prom
     userName = await forward(deps, route, userId, content, { reply_text: text }, 'button reply')
   } catch (err) {
     // The box is already closed, so say the text was lost rather than drop it silently.
-    await tellUser(deps, route.channel, userId, 'Your reply did not reach the session. Click the button to try again.')
+    await tellUser(
+      deps,
+      route.channel,
+      userId,
+      'Your reply did not reach the session. Click the button to try again.',
+    )
     throw err
   }
   deps.replyCache.delete(key)
@@ -447,7 +496,12 @@ async function updateMessage(
   const next = withoutSpentButtons(message.blocks, spentOn(deps, route), choiceLine ?? '')
   if (choiceLine === null) next.pop()
   try {
-    await deps.update({ channel: route.channel, ts: route.messageTs, text: message.text, blocks: next })
+    await deps.update({
+      channel: route.channel,
+      ts: route.messageTs,
+      text: message.text,
+      blocks: next,
+    })
   } catch {
     /* see above */
   }

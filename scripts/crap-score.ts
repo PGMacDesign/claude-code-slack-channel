@@ -49,6 +49,7 @@ const PRODUCTION_FILES = [
   'journal.ts',
   'supervisor.ts',
   'server.ts',
+  'button-actions.ts',
 ] as const
 
 const DEFAULT_THRESHOLD = 30

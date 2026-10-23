@@ -71,7 +71,10 @@ function click(actionIndex: number, user = OWNER, extra: Record<string, unknown>
 
 describe('buildActionMessageBlocks', () => {
   test('a section with the text, then one button per entry with act: ids', () => {
-    expect(blocks[0]).toEqual({ type: 'section', text: { type: 'mrkdwn', text: '*Pixel check* needed' } })
+    expect(blocks[0]).toEqual({
+      type: 'section',
+      text: { type: 'mrkdwn', text: '*Pixel check* needed' },
+    })
     expect(blocks[1].elements.map((e: any) => [e.action_id, e.value, e.style])).toEqual([
       ['act:0', 'more|PGM-410', undefined],
       ['act:1', 'ticket|PGM-410', 'primary'],
@@ -85,7 +88,10 @@ describe('buildActionMessageBlocks', () => {
   })
 })
 
-const only = (...ids: string[]) => (id: string) => ids.includes(id)
+const only =
+  (...ids: string[]) =>
+  (id: string) =>
+    ids.includes(id)
 
 describe('withoutSpentButtons (law 5: the other buttons survive a click)', () => {
   test('removes only the spent button and appends the choice line', () => {
@@ -122,7 +128,10 @@ describe('handleActClick', () => {
         },
       },
     ])
-    expect(calls.update[0].blocks[1].elements.map((e: any) => e.action_id)).toEqual(['act:1', 'act:2'])
+    expect(calls.update[0].blocks[1].elements.map((e: any) => e.action_id)).toEqual([
+      'act:1',
+      'act:2',
+    ])
   })
 
   test('a top-level message reports no thread, so the outbound gate matches what it saw', async () => {
@@ -153,7 +162,10 @@ describe('handleActClick', () => {
     expect(await handleActClick(deps, click(0))).toBe('duplicate')
     expect(calls.notify.length).toBe(1)
     expect(calls.ephemeral.map((e) => e.text)).toEqual(['Already chosen.'])
-    expect(calls.update[1].blocks[1].elements.map((e: any) => e.action_id)).toEqual(['act:1', 'act:2'])
+    expect(calls.update[1].blocks[1].elements.map((e: any) => e.action_id)).toEqual([
+      'act:1',
+      'act:2',
+    ])
   })
 
   test('a stale snapshot never brings back a button already used', async () => {
@@ -180,7 +192,10 @@ describe('handleActClick', () => {
 
   test('law 1: concurrent duplicates forward once', async () => {
     const { deps, calls } = fakes()
-    const results = await Promise.all([handleActClick(deps, click(0)), handleActClick(deps, click(0))])
+    const results = await Promise.all([
+      handleActClick(deps, click(0)),
+      handleActClick(deps, click(0)),
+    ])
     expect(results.sort()).toEqual(['duplicate', 'forwarded'])
     expect(calls.notify.length).toBe(1)
   })
@@ -257,14 +272,26 @@ describe('SendActionsInput', () => {
     expect(SendActionsInput.safeParse({ ...ok, buttons: [] }).success).toBe(false)
     expect(SendActionsInput.safeParse({ ...ok, buttons: [b, b, b, b, b, b] }).success).toBe(false)
     expect(SendActionsInput.safeParse({ ...ok, text: 'a'.repeat(2901) }).success).toBe(false)
-    expect(SendActionsInput.safeParse({ ...ok, buttons: [{ label: 'a'.repeat(76), value: 'v' }] }).success).toBe(false)
-    expect(SendActionsInput.safeParse({ ...ok, buttons: [{ label: 'l', value: 'v'.repeat(2001) }] }).success).toBe(false)
-    expect(SendActionsInput.safeParse({ ...ok, buttons: [{ label: 'l', value: 'v', style: 'link' }] }).success).toBe(false)
+    expect(
+      SendActionsInput.safeParse({ ...ok, buttons: [{ label: 'a'.repeat(76), value: 'v' }] })
+        .success,
+    ).toBe(false)
+    expect(
+      SendActionsInput.safeParse({ ...ok, buttons: [{ label: 'l', value: 'v'.repeat(2001) }] })
+        .success,
+    ).toBe(false)
+    expect(
+      SendActionsInput.safeParse({ ...ok, buttons: [{ label: 'l', value: 'v', style: 'link' }] })
+        .success,
+    ).toBe(false)
   })
 
   test('rejects unknown fields', () => {
     expect(SendActionsInput.safeParse({ ...ok, blocks: [] }).success).toBe(false)
-    expect(SendActionsInput.safeParse({ ...ok, buttons: [{ label: 'l', value: 'v', url: 'x' }] }).success).toBe(false)
+    expect(
+      SendActionsInput.safeParse({ ...ok, buttons: [{ label: 'l', value: 'v', url: 'x' }] })
+        .success,
+    ).toBe(false)
   })
 })
 
@@ -281,7 +308,12 @@ function promptClick(actionIndex: number, user = OWNER, extra: Record<string, un
     trigger_id: '1000000000.0000000001.fakefakefake',
     user: { id: user },
     channel: { id: 'C0CHANNEL01' },
-    message: { ts: '1791961914.000200', text: 'Pixel check needed', blocks: promptBlocks, ...extra },
+    message: {
+      ts: '1791961914.000200',
+      text: 'Pixel check needed',
+      blocks: promptBlocks,
+      ...extra,
+    },
     actions: [{ action_id: el.action_id, value: el.value, text: el.text }],
   }
 }
@@ -300,7 +332,12 @@ function submission(view: any, text: string | undefined, user = OWNER) {
 }
 
 /** Opens the reply box for button `i` as the owner and returns its view. */
-async function openBox(deps: ActClickDeps, calls: { views: any[] }, i = 1, extra: Record<string, unknown> = {}) {
+async function openBox(
+  deps: ActClickDeps,
+  calls: { views: any[] },
+  i = 1,
+  extra: Record<string, unknown> = {},
+) {
   expect(await handleActClick(deps, promptClick(i, OWNER, extra))).toBe('opened')
   return calls.views[calls.views.length - 1].view
 }
@@ -347,7 +384,9 @@ describe('reply-box buttons', () => {
     const { deps, calls } = fakes()
     expect(await handleActClick(deps, promptClick(1, STRANGER))).toBe('refused')
     expect(calls.views.length).toBe(0)
-    expect(calls.ephemeral.map((e) => e.text)).toEqual(['Only the session owner can use these buttons.'])
+    expect(calls.ephemeral.map((e) => e.text)).toEqual([
+      'Only the session owner can use these buttons.',
+    ])
   })
 
   test('a box that fails to open says so and leaves the button live', async () => {
@@ -373,7 +412,9 @@ describe('reply-box buttons', () => {
   test('a submission forwards the label and the typed text once, then takes the button down', async () => {
     const { deps, calls } = fakes()
     const view = await openBox(deps, calls)
-    expect(await handleReplySubmission(deps, submission(view, 'Make the header blue'))).toBe('forwarded')
+    expect(await handleReplySubmission(deps, submission(view, 'Make the header blue'))).toBe(
+      'forwarded',
+    )
     expect(calls.notify).toEqual([
       {
         content: '[button] Change something\n\nMake the header blue',
@@ -390,8 +431,13 @@ describe('reply-box buttons', () => {
     ])
     expect(calls.inbound[0].reason).toBe('button reply')
     expect(calls.update[0].ts).toBe('1791961914.000200')
-    expect(calls.update[0].blocks[1].elements.map((e: any) => e.action_id)).toEqual(['act:0', 'act:2:m'])
-    expect(calls.update[0].blocks[2].elements[0].text).toBe('✓ Owner replied via "Change something"')
+    expect(calls.update[0].blocks[1].elements.map((e: any) => e.action_id)).toEqual([
+      'act:0',
+      'act:2:m',
+    ])
+    expect(calls.update[0].blocks[2].elements[0].text).toBe(
+      '✓ Owner replied via "Change something"',
+    )
     expect(deps.replyCache.size).toBe(0)
   })
 
@@ -436,7 +482,9 @@ describe('reply-box buttons', () => {
   test('a stranger submission is refused and leaves the button usable', async () => {
     const { deps, calls } = fakes()
     const view = await openBox(deps, calls)
-    expect(await handleReplySubmission(deps, submission(view, 'mine now', STRANGER))).toBe('refused')
+    expect(await handleReplySubmission(deps, submission(view, 'mine now', STRANGER))).toBe(
+      'refused',
+    )
     expect(calls.notify.length + calls.inbound.length + calls.update.length).toBe(0)
     expect(calls.ephemeral[0]).toEqual({
       channel: 'C0CHANNEL01',
@@ -455,7 +503,9 @@ describe('reply-box buttons', () => {
       },
     })
     const view = await openBox(deps, calls)
-    await expect(handleReplySubmission(deps, submission(view, 'hello'))).rejects.toThrow('Not connected')
+    await expect(handleReplySubmission(deps, submission(view, 'hello'))).rejects.toThrow(
+      'Not connected',
+    )
     expect(deps.forwarded.size).toBe(0)
     expect(calls.update.length).toBe(0)
     expect(calls.ephemeral[0].text).toContain('did not reach the session')
@@ -489,8 +539,17 @@ describe('reply-box buttons', () => {
     const ignored = [
       submission({ ...view, callback_id: 'someone_else' }, 'x'),
       submission({ ...view, private_metadata: 'not json' }, 'x'),
-      submission({ ...view, private_metadata: JSON.stringify({ c: 'C0CHANNEL01', t: '1.2', a: 'act:0' }) }, 'x'),
-      submission({ ...view, private_metadata: JSON.stringify({ c: 'C0CHANNEL01', t: '1.2', a: 'perm:allow:x' }) }, 'x'),
+      submission(
+        { ...view, private_metadata: JSON.stringify({ c: 'C0CHANNEL01', t: '1.2', a: 'act:0' }) },
+        'x',
+      ),
+      submission(
+        {
+          ...view,
+          private_metadata: JSON.stringify({ c: 'C0CHANNEL01', t: '1.2', a: 'perm:allow:x' }),
+        },
+        'x',
+      ),
       submission(view, '   '),
       submission(view, undefined),
       submission(view, 'x', '<script>'),
@@ -549,11 +608,18 @@ describe('encodeReplyMetadata', () => {
 })
 
 describe('send_actions prompts', () => {
-  const ok = { chat_id: 'C1', text: 'hi', buttons: [{ label: 'Change', value: 'c', prompt: 'What should change?' }] }
+  const ok = {
+    chat_id: 'C1',
+    text: 'hi',
+    buttons: [{ label: 'Change', value: 'c', prompt: 'What should change?' }],
+  }
 
   test('the schema accepts a prompt and rejects bad ones', () => {
     expect(SendActionsInput.safeParse(ok).success).toBe(true)
-    const withPrompt = (prompt: unknown, value = 'c') => ({ ...ok, buttons: [{ label: 'l', value, prompt }] })
+    const withPrompt = (prompt: unknown, value = 'c') => ({
+      ...ok,
+      buttons: [{ label: 'l', value, prompt }],
+    })
     expect(SendActionsInput.safeParse(withPrompt('')).success).toBe(false)
     expect(SendActionsInput.safeParse(withPrompt('p'.repeat(150))).success).toBe(true)
     expect(SendActionsInput.safeParse(withPrompt('p'.repeat(151))).success).toBe(false)
@@ -564,7 +630,10 @@ describe('send_actions prompts', () => {
 
   test('the prompt goes through the outbound secret guard with the text, labels and values', () => {
     const secrets = new Set(['sekrit-fake-value-123'])
-    const leaky = { text: 'hi', buttons: [{ label: 'l', value: 'v', prompt: 'paste sekrit-fake-value-123' }] }
+    const leaky = {
+      text: 'hi',
+      buttons: [{ label: 'l', value: 'v', prompt: 'paste sekrit-fake-value-123' }],
+    }
     expect(sendActionsOutboundText(leaky)).toContain('sekrit-fake-value-123')
     expect(() => assertNoSecretValues(sendActionsOutboundText(leaky), secrets)).toThrow()
     expect(() => assertNoSecretValues(sendActionsOutboundText(ok), secrets)).not.toThrow()
