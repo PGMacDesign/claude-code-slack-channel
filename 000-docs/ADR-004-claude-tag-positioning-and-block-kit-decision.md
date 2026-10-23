@@ -218,7 +218,11 @@ down.
 
 **Residual.** The spent set and the message snapshots live in memory. After a
 bridge restart, a button whose earlier message update failed (so it is still
-on screen) can deliver once more.
+on screen) can deliver once more. So can a reply box that stayed open across the
+restart, even for a button that was spent and taken down before it (for example,
+the same box opened on two devices). The gate journals a delivery before notify,
+as the #287 relay does, so a notify that then fails leaves an allow entry for
+input that never arrived, and its retry writes a second one.
 
 **Honest cost.** Modals are more widget than Decision 2 wanted. The scope above
 keeps the reply box to one free-text field whose every use lands in the
