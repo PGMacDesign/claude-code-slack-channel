@@ -40,6 +40,7 @@ import {
   MAX_BUTTON_VALUE,
   MAX_BUTTONS,
   REPLY_VIEW_CALLBACK,
+  replySubmissionErrors,
   SendActionsInput,
   sendActionsOutboundText,
 } from './button-actions.ts'
@@ -1018,7 +1019,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'send_actions',
       description:
-        'Post one message with up to 5 buttons. A click on a button comes back as a channel message "[button] <label>" from the clicking user, with the button value in meta.action_value; each button works once, and only for allowlisted users. A button with a prompt opens a reply box instead: the typed text comes back after the label ("[button] <label>", a blank line, then the text) and in meta.reply_text, and the button is used up only when the reply is sent.',
+        'Post one message with up to 5 buttons. A click on a button comes back as a channel message "[button] <label>" from the clicking user, with the button value in meta.action_value; each button works once, and only for allowlisted users. A button with a prompt opens a reply box instead: the typed text comes back in the content after the label ("[button] <label>", a blank line, then the text), and the button is used up only when the reply is sent. Clicks pass the same gate as messages: in a requireMention channel, post the buttons inside a thread where you were already mentioned, or every click is refused.',
       inputSchema: {
         type: 'object' as const,
         properties: {
@@ -3095,21 +3096,37 @@ async function handleAllowDenyAction(
 // Clicks already forwarded, keyed by channel, message ts and action id, so a
 // double click or a redelivered interaction reaches the session once.
 const forwardedActClicks = new Set<string>()
-// Messages with an open reply box, so the reply can update them.
-const replyBoxMessages = new Map<string, CachedMessage>()
 const actDeps: ActClickDeps = {
-  allowFrom: () => getAccess().allowFrom,
+  access: () => getAccess(),
+  engagedThreads,
   forwarded: forwardedActClicks,
+  pending: new Set<string>(),
   resolveUserName: (userId) => resolveUserName(userId),
-  recordInbound: ({ channel, threadTs, userId, reason }) => {
+  // Same accounting as a delivered #287 click (deliverButtonClick): engagement
+  // refresh, session key, deliver journal event, supervisor touch so a slow
+  // reply box cannot be idle-reaped, and the permission relay's active thread.
+  recordInbound: async ({ channel, threadTs, messageTs, userId, source, actionId }) => {
+    const threadKey = threadTs ?? messageTs
+    recordEngagedThread(libDeliveredThreadKey(channel, threadKey))
     deliveredThreads.add(libDeliveredThreadKey(channel, threadTs))
-    lastActiveChannel = channel
-    lastActiveThread = threadTs
+    const sessionKey = inboundSessionKey(channel, threadKey, getAccess(), { user: userId })
     journalWrite({
       kind: 'gate.inbound.deliver',
       outcome: 'allow',
       actor: 'session_owner',
-      input: { channel, user: userId, thread_ts: threadTs },
+      sessionKey,
+      input: { channel, user: userId, source, action_id: actionId, thread_ts: threadTs },
+    })
+    if (supervisor !== null) await activateAndTouch(supervisor, sessionKey, userId)
+    lastActiveChannel = channel
+    lastActiveThread = threadTs
+  },
+  recordDrop: ({ channel, userId, source, reason }) => {
+    journalWrite({
+      kind: 'gate.inbound.drop',
+      outcome: 'drop',
+      actor: 'session_owner',
+      input: { channel, user: userId, source },
       reason,
     })
   },
@@ -3118,17 +3135,22 @@ const actDeps: ActClickDeps = {
   postEphemeral: (args) => web.chat.postEphemeral(args),
   // The modal is built as plain Block Kit JSON in button-actions.ts, not as the SDK's View union.
   openView: (args) => web.views.open(args as Parameters<typeof web.views.open>[0]),
-  replyCache: replyBoxMessages,
+  messages: new Map<string, CachedMessage>(),
 }
 
-socket.on('interactive', async ({ body, ack }: { body: any; ack: () => Promise<void> }) => {
+type InteractiveAck = (response?: Record<string, unknown>) => Promise<void>
+
+socket.on('interactive', async ({ body, ack }: { body: any; ack: InteractiveAck }) => {
   try {
-    // An empty ack also closes a submitted reply box.
-    await ack()
     if (body?.type === 'view_submission' && body.view?.callback_id === REPLY_VIEW_CALLBACK) {
-      await handleReplySubmission(actDeps, body)
+      // Validated before the ack, since only the ack can keep the box open with
+      // an error; an empty ack closes it.
+      const errors = replySubmissionErrors(body)
+      await ack(errors ? { response_action: 'errors', errors } : undefined)
+      if (!errors) await handleReplySubmission(actDeps, body)
       return
     }
+    await ack()
     if (body?.type !== 'block_actions' || !body.actions?.length) return
 
     const action = body.actions[0]

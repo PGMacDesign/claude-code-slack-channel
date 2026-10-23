@@ -490,6 +490,52 @@ Residuals: THREAT-MODEL.md R8 (stale opt-in keeps buttons live),
 R9 (empty `allowFrom` admits any member's click), R10 (click-
 triggered tool calls inherit R7).
 
+The `send_actions` reply box is the one modal with its own decision
+(ADR-004 Decision 2b); see the next section.
+
+## Interactive inbound: `send_actions` buttons and the reply box
+
+`send_actions` buttons (`act:<n>`) and the reply boxes they can open
+(`act:<n>:m`) are a second click path, in `button-actions.ts`, with the
+same supervisor contract as the relay above. Scope, gating, the
+`private_metadata` trust model and dedupe are decided in ADR-004
+Decision 2b. The flow:
+
+```
+owner taps act:<n> or act:<n>:m on message M
+   │
+   ▼
+owner check (top-level allowFrom) + decideInteractionRoute
+   │      (refused → journal gate.inbound.drop, ephemeral, return)
+   ▼
+spent? (channel:message:action_id)
+   │      (yes → journal interaction.already_consumed, "Already chosen.")
+   │
+   ├── act:<n>:m → views.open(trigger_id) at once; nothing spent
+   │                  │
+   │                  ▼  view_submission
+   │               blank text → ack with an inline error, box stays open
+   │               otherwise ack (closes box), re-run both checks,
+   │               spent check, then the same path as a click below
+   ▼
+spend (synchronous, before any await)
+   │
+   ▼
+recordEngagedThread + inboundSessionKey + journal gate.inbound.deliver
+(source, action_id, sessionKey) + activateAndTouch
+   │
+   ▼
+await MCP notification "[button] <label>" (+ "\n\n<text>" for a reply)
+   │      (throws → un-spend; a reply also tells the owner it was lost)
+   ▼
+best-effort chat.update from the latest known blocks of M
+```
+
+Clicks and replies obey `requireMention` exactly as the relay's do: a
+top-level message keys on its own ts and cannot be engaged by a click,
+so buttons in a `requireMention` channel must be posted in an engaged
+thread.
+
 ---
 
 ## Obligation schema contract (ccsc-ngn / ccsc-wib, shipped #287)

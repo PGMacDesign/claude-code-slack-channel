@@ -7,17 +7,31 @@ import {
   handleActClick,
   handleReplySubmission,
   isActAction,
+  MAX_BUTTON_LABEL,
+  MAX_BUTTON_VALUE,
+  MAX_BUTTONS,
   MAX_VIEW_METADATA,
-  REPLY_CACHE_CAP,
+  MESSAGE_CACHE_CAP,
   REPLY_VIEW_CALLBACK,
+  replySubmissionErrors,
   SendActionsInput,
   sendActionsOutboundText,
   withoutSpentButtons,
 } from './button-actions.ts'
-import { assertNoSecretValues } from './lib.ts'
+import { type Access, assertNoSecretValues, deliveredThreadKey } from './lib.ts'
 
 const OWNER = 'U0OWNER0001'
 const STRANGER = 'U0STRANGER1'
+
+function accessWith(channel: Partial<Access['channels'][string]> | null = {}): Access {
+  return {
+    dmPolicy: 'allowlist',
+    allowFrom: [OWNER],
+    channels:
+      channel === null ? {} : { C0CHANNEL01: { requireMention: false, allowFrom: [], ...channel } },
+    pending: {},
+  }
+}
 
 function fakes(overrides: Partial<ActClickDeps> = {}) {
   const calls = {
@@ -26,13 +40,19 @@ function fakes(overrides: Partial<ActClickDeps> = {}) {
     ephemeral: [] as any[],
     inbound: [] as any[],
     views: [] as any[],
+    drops: [] as any[],
   }
   const deps: ActClickDeps = {
-    allowFrom: () => [OWNER],
+    access: () => accessWith(),
+    engagedThreads: new Set<string>(),
     forwarded: new Set<string>(),
+    pending: new Set<string>(),
     resolveUserName: async () => 'Owner',
     recordInbound: (a) => {
       calls.inbound.push(a)
+    },
+    recordDrop: (a) => {
+      calls.drops.push(a)
     },
     notify: async (p) => {
       calls.notify.push(p)
@@ -46,7 +66,7 @@ function fakes(overrides: Partial<ActClickDeps> = {}) {
     openView: async (a) => {
       calls.views.push(a)
     },
-    replyCache: new Map(),
+    messages: new Map(),
     ...overrides,
   }
   return { deps, calls }
@@ -65,7 +85,9 @@ function click(actionIndex: number, user = OWNER, extra: Record<string, unknown>
     user: { id: user },
     channel: { id: 'C0CHANNEL01' },
     message: { ts: '1791961914.000100', text: 'Pixel check needed', blocks, ...extra },
-    actions: [{ action_id: el.action_id, value: el.value, text: el.text }],
+    actions: [
+      { action_id: el.action_id, value: el.value, text: el.text, action_ts: '1791961999.1' },
+    ],
   }
 }
 
@@ -144,7 +166,8 @@ describe('handleActClick', () => {
         threadTs: undefined,
         userId: OWNER,
         messageTs: '1791961914.000100',
-        reason: 'button click',
+        source: 'block_actions',
+        actionId: 'act:0',
       },
     ])
   })
@@ -246,7 +269,7 @@ describe('handleActClick', () => {
   })
 
   test('a malformed user id is ignored', async () => {
-    const { deps, calls } = fakes({ allowFrom: () => ['<script>'] })
+    const { deps, calls } = fakes({ access: () => ({ ...accessWith(), allowFrom: ['<script>'] }) })
     expect(await handleActClick(deps, click(0, '<script>'))).toBe('ignored')
     expect(calls.notify.length).toBe(0)
   })
@@ -314,7 +337,9 @@ function promptClick(actionIndex: number, user = OWNER, extra: Record<string, un
       blocks: promptBlocks,
       ...extra,
     },
-    actions: [{ action_id: el.action_id, value: el.value, text: el.text }],
+    actions: [
+      { action_id: el.action_id, value: el.value, text: el.text, action_ts: '1791961999.2' },
+    ],
   }
 }
 
@@ -398,7 +423,7 @@ describe('reply-box buttons', () => {
     expect(await handleActClick(deps, promptClick(1))).toBe('failed')
     expect(calls.ephemeral.length).toBe(1)
     expect(deps.forwarded.size).toBe(0)
-    expect(deps.replyCache.size).toBe(0)
+    expect(deps.messages.size).toBe(0)
   })
 
   test('an unreadable envelope on an act:<n>:m button is ignored', async () => {
@@ -425,11 +450,11 @@ describe('reply-box buttons', () => {
           user: 'Owner',
           ts: '1791961914.000200',
           action_value: 'change|PGM-410',
-          reply_text: 'Make the header blue',
         },
       },
     ])
-    expect(calls.inbound[0].reason).toBe('button reply')
+    expect(calls.inbound[0].source).toBe('view_submission')
+    expect(calls.inbound[0].actionId).toBe('act:1:m')
     expect(calls.update[0].ts).toBe('1791961914.000200')
     expect(calls.update[0].blocks[1].elements.map((e: any) => e.action_id)).toEqual([
       'act:0',
@@ -438,7 +463,6 @@ describe('reply-box buttons', () => {
     expect(calls.update[0].blocks[2].elements[0].text).toBe(
       '✓ Owner replied via "Change something"',
     )
-    expect(deps.replyCache.size).toBe(0)
   })
 
   test('a reply from a threaded message reports that thread', async () => {
@@ -519,7 +543,7 @@ describe('reply-box buttons', () => {
     const view = await openBox(before.deps, before.calls)
     const { deps, calls } = fakes()
     expect(await handleReplySubmission(deps, submission(view, 'after restart'))).toBe('forwarded')
-    expect(calls.notify[0].meta.reply_text).toBe('after restart')
+    expect(calls.notify[0].content).toBe('[button] Change something\n\nafter restart')
     expect(calls.update.length).toBe(0)
   })
 
@@ -560,10 +584,33 @@ describe('reply-box buttons', () => {
 
   test('the snapshot cache stays bounded', async () => {
     const { deps, calls } = fakes()
-    for (let i = 0; i < REPLY_CACHE_CAP; i++) deps.replyCache.set(`k${i}`, { text: '', blocks: [] })
+    for (let i = 0; i < MESSAGE_CACHE_CAP; i++) deps.messages.set(`k${i}`, { text: '', blocks: [] })
     await openBox(deps, calls)
-    expect(deps.replyCache.size).toBe(REPLY_CACHE_CAP)
-    expect(deps.replyCache.has('k0')).toBe(false)
+    expect(deps.messages.size).toBe(MESSAGE_CACHE_CAP)
+    expect(deps.messages.has('k0')).toBe(false)
+  })
+
+  test('a whitespace-only reply keeps the box open with an error instead of vanishing', () => {
+    const view = { callback_id: REPLY_VIEW_CALLBACK, private_metadata: '{}' }
+    expect(replySubmissionErrors(submission(view, ' \n\t '))).toEqual({
+      reply: 'Type a reply before sending.',
+    })
+    expect(replySubmissionErrors(submission(view, undefined))).toEqual({
+      reply: 'Type a reply before sending.',
+    })
+    expect(replySubmissionErrors(submission(view, 'ok'))).toBeNull()
+  })
+
+  test('a box whose route would not fit Slack metadata is refused, never cut', async () => {
+    const { deps, calls } = fakes()
+    // Built by hand: SendActionsInput would reject this button at send time.
+    const huge = buildActionMessageBlocks('t', [
+      { label: 'L', value: '"'.repeat(MAX_BUTTON_VALUE), prompt: 'p' },
+    ])
+    const body = promptClick(0)
+    body.actions[0] = { ...body.actions[0], ...huge[1].elements[0] }
+    expect(await handleActClick(deps, body)).toBe('failed')
+    expect(calls.views.length).toBe(0)
   })
 })
 
@@ -588,22 +635,28 @@ describe('encodeReplyMetadata', () => {
     expect(JSON.parse(encodeReplyMetadata({ ...route, threadTs: '1.1' })).th).toBe('1.1')
   })
 
-  test("trims only the value until escaping fits Slack's limit", () => {
-    const out = encodeReplyMetadata({ ...route, value: '"'.repeat(1900) })
+  test('every button the schema accepts fits, even with the worst escaping and long ids', () => {
+    // \u0001 escapes to six characters, the worst case for both the envelope and the metadata.
+    const worst = '\u0001'
+    let n = 0
+    const accepted = (len: number) =>
+      SendActionsInput.safeParse({
+        chat_id: 'C1',
+        text: 't',
+        buttons: [{ label: worst.repeat(MAX_BUTTON_LABEL), value: worst.repeat(len), prompt: 'p' }],
+      }).success
+    while (accepted(n + 1)) n++
+    expect(n).toBeGreaterThan(0)
+    const out = encodeReplyMetadata({
+      channel: 'C'.repeat(24),
+      messageTs: '9'.repeat(24),
+      actionId: `act:${MAX_BUTTONS - 1}:m`,
+      label: worst.repeat(MAX_BUTTON_LABEL),
+      value: worst.repeat(n),
+      threadTs: '9'.repeat(24),
+    })
     expect(out.length).toBeLessThanOrEqual(MAX_VIEW_METADATA)
-    const parsed = JSON.parse(out)
-    expect(parsed.l).toBe('Change something')
-    expect(parsed.v.length).toBeGreaterThan(1000)
-    expect(/^"+$/.test(parsed.v)).toBe(true)
-  })
-
-  test('never cuts a surrogate pair in half', () => {
-    // 2913 value chars fit here, so the first cut lands between the halves of an emoji
-    const out = encodeReplyMetadata({ ...route, value: `${'a'.repeat(2900)}${'😀'.repeat(100)}` })
-    expect(out.length).toBeLessThanOrEqual(MAX_VIEW_METADATA)
-    const v: string = JSON.parse(out).v
-    expect(/[\uD800-\uDBFF]$/.test(v)).toBe(false)
-    expect(v).toBe(`${'a'.repeat(2900)}${'😀'.repeat(6)}`)
+    expect(JSON.parse(out).v).toBe(worst.repeat(n))
   })
 })
 
@@ -637,5 +690,133 @@ describe('send_actions prompts', () => {
     expect(sendActionsOutboundText(leaky)).toContain('sekrit-fake-value-123')
     expect(() => assertNoSecretValues(sendActionsOutboundText(leaky), secrets)).toThrow()
     expect(() => assertNoSecretValues(sendActionsOutboundText(ok), secrets)).not.toThrow()
+  })
+})
+
+describe('the interaction gate (same as #287 clicks and messages)', () => {
+  const engaged = (ts: string) => new Set([deliveredThreadKey('C0CHANNEL01', ts)])
+
+  test('a requireMention channel refuses clicks and replies in an unengaged thread', async () => {
+    const thread = new Set<string>()
+    const { deps, calls } = fakes({
+      access: () => accessWith({ requireMention: true }),
+      engagedThreads: thread,
+    })
+    expect(await handleActClick(deps, click(0))).toBe('refused')
+    expect(await handleActClick(deps, promptClick(1))).toBe('refused')
+    expect(calls.views.length + calls.notify.length + calls.inbound.length).toBe(0)
+    expect(deps.forwarded.size).toBe(0)
+    expect(calls.drops.map((d) => [d.source, d.reason])).toEqual([
+      ['block_actions', 'channel.require_mention'],
+      ['block_actions', 'channel.require_mention'],
+    ])
+
+    // A box opened while the thread was engaged is re-gated on submit.
+    thread.add(deliveredThreadKey('C0CHANNEL01', '1791961914.000200'))
+    const view = await openBox(deps, calls)
+    thread.clear()
+    expect(await handleReplySubmission(deps, submission(view, 'hi'))).toBe('refused')
+    expect(calls.notify.length).toBe(0)
+    expect(calls.drops[2]).toEqual({
+      channel: 'C0CHANNEL01',
+      userId: OWNER,
+      source: 'view_submission',
+      reason: 'channel.require_mention',
+    })
+  })
+
+  test('the same requireMention channel delivers once the thread is engaged', async () => {
+    const { deps, calls } = fakes({
+      access: () => accessWith({ requireMention: true }),
+      engagedThreads: new Set([...engaged('1791961914.000100'), ...engaged('1791961914.000200')]),
+    })
+    expect(await handleActClick(deps, click(0))).toBe('forwarded')
+    const view = await openBox(deps, calls)
+    expect(await handleReplySubmission(deps, submission(view, 'hi'))).toBe('forwarded')
+    expect(calls.notify.length).toBe(2)
+  })
+
+  test('a threaded message is gated on its thread, not its own ts', async () => {
+    const { deps } = fakes({
+      access: () => accessWith({ requireMention: true }),
+      engagedThreads: engaged('1791960000.000001'),
+    })
+    expect(await handleActClick(deps, click(0, OWNER, { thread_ts: '1791960000.000001' }))).toBe(
+      'forwarded',
+    )
+  })
+
+  test('a channel the session never opted into refuses even the owner', async () => {
+    const { deps, calls } = fakes({ access: () => accessWith(null) })
+    expect(await handleActClick(deps, click(0))).toBe('refused')
+    expect(calls.drops[0].reason).toBe('channel.not_opted')
+    expect(calls.ephemeral[0].text).toContain('channel.not_opted')
+  })
+
+  test('a per-channel allowFrom that leaves the owner out refuses', async () => {
+    const { deps, calls } = fakes({ access: () => accessWith({ allowFrom: ['U0SOMEONE01'] }) })
+    expect(await handleActClick(deps, click(0))).toBe('refused')
+    expect(calls.drops[0].reason).toBe('channel.allowfrom_miss')
+  })
+
+  test('refusals and duplicates are journaled, deliveries are not dropped', async () => {
+    const { deps, calls } = fakes()
+    await handleActClick(deps, click(0, STRANGER))
+    await handleActClick(deps, click(0))
+    await handleActClick(deps, click(0))
+    expect(calls.drops.map((d) => d.reason)).toEqual([
+      'interaction.not_owner',
+      'interaction.already_consumed',
+    ])
+  })
+})
+
+describe('message updates build on the latest state', () => {
+  const contextLines = (b: any[]) =>
+    b.filter((x) => x.type === 'context').map((x) => x.elements[0].text)
+
+  test("a reply's update keeps an earlier click's choice line", async () => {
+    const { deps, calls } = fakes()
+    await handleActClick(deps, promptClick(0))
+    const view = await openBox(deps, calls)
+    await handleReplySubmission(deps, submission(view, 'blue'))
+    const last = calls.update[calls.update.length - 1].blocks
+    expect(contextLines(last)).toEqual([
+      '✓ Owner chose "Looks good"',
+      '✓ Owner replied via "Change something"',
+    ])
+    expect(last[1].elements.map((e: any) => e.action_id)).toEqual(['act:2:m'])
+  })
+
+  test('a click with a stale payload keeps the earlier choice line too', async () => {
+    const { deps, calls } = fakes()
+    await handleActClick(deps, click(0))
+    await handleActClick(deps, click(1)) // payload still shows the original message
+    expect(contextLines(calls.update[1].blocks)).toEqual([
+      '✓ Owner chose "More info"',
+      '✓ Owner chose "Make a ticket"',
+    ])
+  })
+
+  test('a duplicate never takes a button down while its forward is in flight', async () => {
+    let release: (ok: boolean) => void = () => {}
+    const { deps, calls } = fakes({
+      notify: (p) =>
+        new Promise<void>((resolve, reject) => {
+          release = (ok) => (ok ? resolve() : reject(new Error('Not connected')))
+          calls.notify.push(p)
+        }),
+    })
+    const first = handleActClick(deps, click(0))
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(calls.notify.length).toBe(1)
+    expect(await handleActClick(deps, click(0))).toBe('duplicate')
+    expect(calls.update.length).toBe(0)
+    release(false)
+    await expect(first).rejects.toThrow('Not connected')
+    expect(calls.update.length).toBe(0)
+    expect(deps.forwarded.size).toBe(0)
+    expect(deps.pending.size).toBe(0)
   })
 })

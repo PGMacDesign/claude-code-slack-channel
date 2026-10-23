@@ -12,6 +12,10 @@ interactive Block Kit *output* on the `reply` tool is recorded as in-scope, unde
 a `portable ∧ journaled ∧ non-native-component-coupled` bright line. Triggered by the #270
 review (`ccsc-ysu`).
 
+**Amended 2026-10-22**: see [Amendment (Decision 2b)](#amendment-2026-10-22-decision-2b-send_actions-buttons-and-the-reply-box):
+`send_actions` buttons and the one-field reply box they can open are recorded as in
+scope under the same bright line, with their gating, metadata trust model and dedupe.
+
 ## Context
 
 On 2026-06-23 Anthropic shipped **Claude Tag** — first-party `@Claude` in Slack:
@@ -139,6 +143,87 @@ through `getChannelPolicy`, the outbox downgrade contract, and the threat-model 
 journal doc updates) are tracked on `ccsc-ysu` and are independent of this scope
 decision.
 
+## Amendment 2026-10-22 (Decision 2b): `send_actions` buttons and the reply box
+
+**Status of this amendment: PROPOSED**, landing with the `send_actions` change
+(`button-actions.ts`); it becomes ACCEPTED when that change merges. Decision 2a
+requires a decision for each further interactive primitive. This records one for
+two surfaces:
+
+1. **`send_actions` buttons** (`act:<n>`): standard Block Kit buttons posted by a
+   dedicated tool, whose clicks return to the session as inbound events. This is
+   the primitive Decision 2a already blessed, on a second tool with its own click
+   path, so the decision here covers only how that path is gated and deduped.
+2. **The reply box** (`act:<n>:m`): a button that carries a prompt opens a Slack
+   modal; the text typed into it returns to the session with the click. Modals
+   are a new primitive under Decision 2a's bright line.
+
+**Decision 2b: both are IN SCOPE**, under the bright line:
+
+- **Portable.** Standard Block Kit buttons and a standard modal (`views.open`)
+  with one `plain_text_input`. No Tag-native components, no select menus, no
+  external data sources.
+- **Journaled.** Every delivered click or reply writes `gate.inbound.deliver`
+  with `source` (`block_actions` or `view_submission`), `action_id` and the
+  session key. Every refusal and duplicate writes `gate.inbound.drop`
+  (`interaction.not_owner`, the interaction gate's drop reasons, or
+  `interaction.already_consumed`).
+- **Non-native-component-coupled.** Nothing depends on Tag-era components.
+
+**Scope.** Exactly one modal shape is blessed: a fixed title, one required
+multiline text input whose label is the session's prompt (at most 150
+characters, run through the same outbound secret guard as the message text,
+labels and values), and Send / Cancel. Multi-step views (`views.update`,
+`views.push`), other input types, App Home, and modals opened by anything other
+than an `act:<n>:m` click each need their own decision.
+
+**Gating.** A click and a submission each pass two synchronous checks before
+anything is spent: the top-level `allowFrom` owner check, then
+`decideInteractionRoute`, the same gate as #287 option-button clicks (channel
+opt-in, per-channel `allowFrom`, DM pairing, `requireMention` through the
+engaged-threads set). The owner check makes these buttons stricter than the
+#287 relay, so residual R9 (an empty `allowFrom` admits any member) does not
+apply to them. A submission is gated again on arrival, because access or thread
+engagement can change while the box is open. Opening a box delivers nothing to
+the session. A delivered click or reply gets the same accounting as a delivered
+message: engaged-thread refresh, a session key that honors `perUserSessions`,
+`activateAndTouch` (so a slow reply cannot be idle-reaped), and the permission
+relay's active thread. Consequence: in a `requireMention` channel, a top-level
+`send_actions` message keys on its own ts, which no mention has engaged, so its
+buttons only work when posted inside an engaged thread.
+
+**Trust model of `private_metadata`.** The bridge writes it in `views.open`, and
+Slack returns it with the submission over the authenticated Socket Mode
+connection; users cannot edit it. It is still treated as routing, never as
+authority: it carries the channel, message ts, action id, label, value and
+thread ts, while authorization comes only from re-running both checks against
+the submitting user. It is shape-validated, and anything but an `act:<n>:m`
+action id is ignored, so a submission can never spend a plain `act:<n>` button
+or reach a `perm:` approval. It fits Slack's 3000-character limit by
+construction (the escaped value is bounded by the 2000-character button
+envelope), so it is never truncated; an oversize route is refused at click
+time. The typed text travels only in the notification content, not in meta,
+since meta values render as attributes.
+
+**Dedupe.** Each button is keyed `channel:message_ts:action_id` and spent
+synchronously after the spent check, with no await between, so concurrent
+duplicate clicks, or two boxes opened on one button, forward once. Opening a box
+spends nothing. Unlike the #287 consumed-click store, a button is un-spent when
+the MCP notification throws, because that input never reached the session and
+the owner should be able to retry; "delivered at most once" still holds, since
+only a successful notification leaves the button spent. A duplicate that
+arrives while a forward is in flight answers "Already chosen." but leaves the
+message alone, so a forward that then fails does not leave its button taken
+down.
+
+**Residual.** The spent set and the message snapshots live in memory. After a
+bridge restart, a button whose earlier message update failed (so it is still
+on screen) can deliver once more.
+
+**Honest cost.** Modals are more widget than Decision 2 wanted. The scope above
+keeps the reply box to one free-text field whose every use lands in the
+journal, which is the same trade Decision 2a made for buttons.
+
 ## Consequences
 
 - `ccsc-pko.1` (approval-preview spike) and `ccsc-pko.2` (native-component
@@ -158,6 +243,9 @@ decision.
   further interactive primitive (modals, selects, native components) still needs
   its own decision. The #270 feature that triggered this is accept-with-conditions
   (`ccsc-ysu`), not a parity commitment.
+- **(Amendment 2026-10-22)** `send_actions` buttons and their one-field reply box
+  are in scope (Decision 2b), gated like #287 clicks plus an owner check. Other
+  modal shapes still need their own decision.
 
 ## Related
 
